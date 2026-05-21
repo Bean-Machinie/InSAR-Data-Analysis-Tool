@@ -285,6 +285,15 @@ def inspect_geotiff_files(geotiff_files: list[Path], max_files: int = 5) -> None
         inspect_geotiff(path)
 
 
+def read_csv_table(csv_path: Path):
+    import pandas as pd
+
+    try:
+        return pd.read_csv(csv_path, comment="#")
+    except Exception:
+        return pd.read_csv(csv_path, comment="#", sep=None, engine="python")
+
+
 def inspect_first_csv(csv_files: list[Path]) -> Path | None:
     print_section("CSV time series inspection")
 
@@ -300,7 +309,7 @@ def inspect_first_csv(csv_files: list[Path]) -> Path | None:
 
     csv_path = csv_files[0]
     try:
-        data = pd.read_csv(csv_path)
+        data = read_csv_table(csv_path)
     except Exception as exc:
         print(f"Could not read CSV file {csv_path}: {exc}")
         return None
@@ -407,7 +416,7 @@ def plot_first_timeseries(csv_path: Path) -> bool:
         return False
 
     try:
-        data = pd.read_csv(csv_path)
+        data = read_csv_table(csv_path)
         numeric_columns = list(data.select_dtypes(include="number").columns)
         if not numeric_columns:
             print("CSV quicklook skipped: no numeric columns found.")
