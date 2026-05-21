@@ -1,0 +1,120 @@
+{
+  "project": "project_dam",
+  "orbit": "D",
+  "created": "2026-05-21T13:27:12.153512Z",
+  "crs": "EPSG:4326",
+  "files": {
+    "netcdf": {
+      "outputs/project_dam_D/results_wide.nc": 13937214,
+      "outputs/project_dam_D/results_tight.nc": 851509
+    },
+    "geotiffs": {
+      "outputs/project_dam_D/geotiffs/velocity_sbas.tif": 43591,
+      "outputs/project_dam_D/geotiffs/velocity_ps.tif": 43536,
+      "outputs/project_dam_D/geotiffs/rmse_sbas.tif": 41235,
+      "outputs/project_dam_D/geotiffs/rmse_ps.tif": 40905,
+      "outputs/project_dam_D/geotiffs/dem.tif": 40715,
+      "outputs/project_dam_D/geotiffs/psf.tif": 41256,
+      "outputs/project_dam_D/geotiffs/disp_sbas_2018-11-06.tif": 1486,
+      "outputs/project_dam_D/geotiffs/disp_sbas_2018-11-18.tif": 43792,
+      "outputs/project_dam_D/geotiffs/disp_sbas_2018-11-30.tif": 43769,
+      "outputs/project_dam_D/geotiffs/disp_sbas_2018-12-12.tif": 43644,
+      "outputs/project_dam_D/geotiffs/disp_sbas_2018-12-24.tif": 43648,
+      "outputs/project_dam_D/geotiffs/disp_sbas_2019-01-05.tif": 43682,
+      "outputs/project_dam_D/geotiffs/disp_sbas_2019-01-17.tif": 43622,
+      "outputs/project_dam_D/geotiffs/disp_sbas_2019-01-29.tif": 43588,
+      "outputs/project_dam_D/geotiffs/disp_ps_2018-11-06.tif": 1480,
+      "outputs/project_dam_D/geotiffs/disp_ps_2018-11-18.tif": 34817,
+      "outputs/project_dam_D/geotiffs/disp_ps_2018-11-30.tif": 40924,
+      "outputs/project_dam_D/geotiffs/disp_ps_2018-12-12.tif": 40895,
+      "outputs/project_dam_D/geotiffs/disp_ps_2018-12-24.tif": 43390,
+      "outputs/project_dam_D/geotiffs/disp_ps_2019-01-05.tif": 43394,
+      "outputs/project_dam_D/geotiffs/disp_ps_2019-01-17.tif": 43543,
+      "outputs/project_dam_D/geotiffs/disp_ps_2019-01-29.tif": 43499
+    },
+    "parameters": "outputs/project_dam_D/parameters.json"
+  },
+  "extents": {
+    "wide_bounds_lonlat": [
+      -44.18070445607243,
+      -20.17931268763593,
+      -44.060845484818095,
+      -20.062580836171033
+    ],
+    "tight_bounds_lonlat": [
+      -44.135708379674014,
+      -20.134373130174488,
+      -44.10584119189669,
+      -20.107580724639845
+    ]
+  },
+  "variables": {
+    "velocity_sbas": {
+      "units": "mm/year",
+      "description": "LOS velocity from SBAS (Small Baseline Subset)",
+      "shape": {
+        "lat": 444,
+        "lon": 464
+      }
+    },
+    "velocity_ps": {
+      "units": "mm/year",
+      "description": "LOS velocity from PS (Persistent Scatterers)",
+      "shape": {
+        "lat": 444,
+        "lon": 464
+      }
+    },
+    "rmse_sbas": {
+      "units": "mm",
+      "description": "SBAS LSQ residual RMSE",
+      "shape": {
+        "lat": 444,
+        "lon": 464
+      }
+    },
+    "rmse_ps": {
+      "units": "mm",
+      "description": "PS LSQ residual RMSE",
+      "shape": {
+        "lat": 444,
+        "lon": 464
+      }
+    },
+    "displacement_sbas": {
+      "units": "mm",
+      "description": "Cumulative LOS displacement from SBAS, per date",
+      "shape": {
+        "date": 8,
+        "lat": 444,
+        "lon": 464
+      }
+    },
+    "displacement_ps": {
+      "units": "mm",
+      "description": "Cumulative LOS displacement from PS, per date",
+      "shape": {
+        "date": 8,
+        "lat": 444,
+        "lon": 464
+      }
+    },
+    "dem": {
+      "units": "m",
+      "description": "Copernicus GLO-30 DEM, ellipsoidal",
+      "shape": {
+        "lat": 444,
+        "lon": 464
+      }
+    },
+    "psf": {
+      "units": "1",
+      "description": "Persistent Scatterers Function",
+      "shape": {
+        "lat": 444,
+        "lon": 464
+      }
+    }
+  },
+  "loader_example": "import xarray as xr\nds = xr.open_dataset('outputs/project_dam_D/results_tight.nc')\nvel = ds.velocity_sbas               # mm/year, EPSG:4326\nts = ds.displacement_sbas.sel(lat=-20.12, lon=-44.12, method='nearest')\n"
+}
