@@ -16,5 +16,10 @@ python insar_deformation_viewer.py Data\project_D_results_only
 
 Current standard SBAS variables include `sbas_displacement_raw`,
 `sbas_displacement_masked`, `sbas_displacement_segmented_same_pixel`,
-`sbas_velocity_raw`, `sbas_velocity_masked`, `sbas_rmse_raw`, and
-`sbas_rmse_masked`.
+`sbas_velocity_raw`, `sbas_velocity_masked`, `coherence_median`, and
+`valid_pixel_mask`.
+
+The interactive viewer starts from a satellite basemap and lets you toggle
+ground maps separately from SBAS data overlays. The overlays are built from the
+NetCDF arrays, so selecting pixels still drives the displacement time-series
+inspector rather than flattening the product into static raster images.

@@ -1,5 +1,5 @@
 """
-Interactive AOI deformation viewer.
+Interactive SBAS map and time-series viewer.
 
 Run:
     python insar_deformation_viewer.py Data\\project_D_results_only
@@ -8,11 +8,10 @@ Then open:
     http://127.0.0.1:8050
 
 The project folder can be either the outer export bundle or the inner
-outputs/<project>_<orbit> product folder. If an AOI-clipped NetCDF exists it is
-used first; otherwise the viewer falls back to results_tight.nc.
+outputs/<project>_<orbit> product folder.
 
 Dependency notes:
-    pip install dash plotly xarray netcdf4 rioxarray pandas matplotlib numpy
+    pip install dash plotly xarray netcdf4 pandas matplotlib numpy
 """
 
 from __future__ import annotations
@@ -27,48 +26,189 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import xarray as xr
-from dash import Dash, Input, Output, State, ctx, dcc, html
+from dash import ALL, Dash, Input, Output, State, ctx, dcc, html
 
-from insar_project import (
-    DISPLACEMENT_VARIABLES,
-    QUALITY_VARIABLES,
-    VARIABLE_LABELS,
-    ProjectPaths,
-    add_project_dir_argument,
-    find_netcdf_files,
-    resolve_project_paths,
-)
+from insar_project import ProjectPaths, add_project_dir_argument, find_netcdf_files, resolve_project_paths
 
-DEFAULT_RMSE_THRESHOLD = 0.50
 
 APP_ACCENT = "#126a65"
-APP_BG = "#f5f7f8"
+APP_BG = "#edf1f2"
 PANEL_BG = "#ffffff"
 TEXT_MAIN = "#172126"
 TEXT_MUTED = "#5d6970"
+
+DEFAULT_ZOOM = 14
+
+
+@dataclass(frozen=True)
+class TileLayerSpec:
+    key: str
+    label: str
+    url: str
+    attribution: str
+    default_enabled: bool
+    default_opacity: float
+
+
+@dataclass(frozen=True)
+class DataLayerSpec:
+    key: str
+    label: str
+    variable: str | None
+    kind: str
+    units: str
+    colorscale: str | list
+    default_enabled: bool
+    default_opacity: float
 
 
 @dataclass(frozen=True)
 class ViewerData:
     dataset_path: Path
     parameters_path: Path
-    aoi_lons: np.ndarray | None
-    aoi_lats: np.ndarray | None
-    variables: tuple[str, ...]
+    title: str
     dates: pd.DatetimeIndex
-    latitudes: np.ndarray
-    longitudes: np.ndarray
-    pixel_rows: np.ndarray
-    pixel_cols: np.ndarray
     pixel_lats: np.ndarray
     pixel_lons: np.ndarray
-    series_by_variable: dict[str, np.ndarray]
-    rmse_by_variable: dict[str, np.ndarray]
-    rmse_ranges: dict[str, tuple[float, float]]
+    pixel_rows: np.ndarray
+    pixel_cols: np.ndarray
+    layer_values: dict[str, np.ndarray]
+    layer_specs: tuple[DataLayerSpec, ...]
+    displacement_series: dict[str, np.ndarray]
+    displacement_labels: dict[str, str]
+    aoi_lons: np.ndarray | None
+    aoi_lats: np.ndarray | None
+    center_lat: float
+    center_lon: float
     default_selected_ids: list[int]
 
 
+BASEMAP_SPECS: tuple[TileLayerSpec, ...] = (
+    TileLayerSpec(
+        key="esri_satellite",
+        label="Esri Satellite",
+        url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        attribution="Tiles (c) Esri",
+        default_enabled=True,
+        default_opacity=1.0,
+    ),
+    TileLayerSpec(
+        key="openstreetmap",
+        label="OpenStreetMap",
+        url="https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+        attribution="(c) OpenStreetMap contributors",
+        default_enabled=False,
+        default_opacity=0.75,
+    ),
+    TileLayerSpec(
+        key="carto_light",
+        label="Carto Light",
+        url="https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
+        attribution="(c) OpenStreetMap contributors (c) CARTO",
+        default_enabled=False,
+        default_opacity=0.7,
+    ),
+)
+
+REQUESTED_DATA_LAYERS: tuple[DataLayerSpec, ...] = (
+    DataLayerSpec(
+        key="sbas_velocity_raw",
+        label="SBAS velocity (raw) [mm/year]",
+        variable="sbas_velocity_raw",
+        kind="scalar",
+        units="mm/year",
+        colorscale="RdBu_r",
+        default_enabled=False,
+        default_opacity=0.82,
+    ),
+    DataLayerSpec(
+        key="sbas_velocity_masked",
+        label="SBAS velocity (masked) [mm/year]",
+        variable="sbas_velocity_masked",
+        kind="scalar",
+        units="mm/year",
+        colorscale="RdBu_r",
+        default_enabled=True,
+        default_opacity=0.88,
+    ),
+    DataLayerSpec(
+        key="coherence_median",
+        label="Coherence (median across pairs)",
+        variable="coherence_median",
+        kind="scalar",
+        units="coherence",
+        colorscale="Viridis",
+        default_enabled=False,
+        default_opacity=0.76,
+    ),
+    DataLayerSpec(
+        key="valid_pixel_mask",
+        label="valid_pixel_mask (coh >= 0.3)",
+        variable="valid_pixel_mask",
+        kind="mask",
+        units="valid",
+        colorscale=[
+            [0.0, "#9aa7ad"],
+            [0.499, "#9aa7ad"],
+            [0.5, "#21a67a"],
+            [1.0, "#21a67a"],
+        ],
+        default_enabled=False,
+        default_opacity=0.62,
+    ),
+    DataLayerSpec(
+        key="aoi_original",
+        label="AOI (original)",
+        variable=None,
+        kind="aoi",
+        units="",
+        colorscale="",
+        default_enabled=True,
+        default_opacity=1.0,
+    ),
+)
+
+DISPLACEMENT_VARIABLES = (
+    ("sbas_displacement_raw", "SBAS raw displacement"),
+    ("sbas_displacement_masked", "SBAS masked displacement"),
+    ("sbas_displacement_segmented_same_pixel", "SBAS segmented displacement"),
+    ("displacement_sbas", "SBAS displacement"),
+)
+
 VIEWER_DATA: ViewerData | None = None
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    add_project_dir_argument(parser)
+    parser.add_argument(
+        "--dataset",
+        type=Path,
+        help="NetCDF dataset to view. Defaults to results_tight.nc, then results_wide.nc.",
+    )
+    parser.add_argument("--host", default="127.0.0.1", help="Dash host.")
+    parser.add_argument("--port", type=int, default=8050, help="Dash port.")
+    parser.add_argument("--debug", action="store_true", help="Run Dash in debug mode.")
+    return parser.parse_args()
+
+
+def default_dataset_path(project_paths: ProjectPaths) -> Path:
+    candidates = (
+        project_paths.product_dir / "results_tight.nc",
+        project_paths.aoi_output_dir / "results_aoi_masked.nc",
+        project_paths.product_dir / "results_wide.nc",
+    )
+    for path in candidates:
+        if path.exists():
+            return path
+
+    nc_files = find_netcdf_files(project_paths)
+    if nc_files:
+        return nc_files[0]
+
+    raise FileNotFoundError(
+        f"No NetCDF dataset found under product folder: {project_paths.product_dir}"
+    )
 
 
 def load_parameters(parameters_path: Path) -> dict:
@@ -118,6 +258,16 @@ def make_polygon_mask(
     return mask.reshape((len(lat_values), len(lon_values)))
 
 
+def finite_mean_by_column(values: np.ndarray) -> np.ndarray:
+    finite = np.isfinite(values)
+    counts = finite.sum(axis=0)
+    sums = np.where(finite, values, 0.0).sum(axis=0)
+    means = np.full(values.shape[1], np.nan, dtype="float64")
+    valid_columns = counts > 0
+    means[valid_columns] = sums[valid_columns] / counts[valid_columns]
+    return means
+
+
 def nearest_pixel_id(
     pixel_lons: np.ndarray,
     pixel_lats: np.ndarray,
@@ -133,90 +283,100 @@ def nearest_pixel_id(
     return int(candidate_ids[int(np.nanargmin(distances))])
 
 
+def finite_color_range(values: np.ndarray, symmetric: bool) -> tuple[float, float]:
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return (-1.0, 1.0) if symmetric else (0.0, 1.0)
+
+    if symmetric:
+        max_abs = float(np.nanpercentile(np.abs(finite), 98))
+        if max_abs == 0:
+            max_abs = 1.0
+        return -max_abs, max_abs
+
+    low, high = np.nanpercentile(finite, [2, 98])
+    if low == high:
+        high = low + 1.0
+    return float(low), float(high)
+
+
+def build_spatial_mask(dataset, latitudes: np.ndarray, longitudes: np.ndarray, aoi_coordinates) -> np.ndarray:
+    if "aoi_mask" in dataset:
+        return dataset["aoi_mask"].values.astype(bool)
+
+    if aoi_coordinates:
+        polygon_mask = make_polygon_mask(longitudes, latitudes, aoi_coordinates)
+        if polygon_mask is not None:
+            return polygon_mask
+
+    candidate_masks = []
+    for spec in REQUESTED_DATA_LAYERS:
+        if spec.variable and spec.variable in dataset:
+            values = dataset[spec.variable].transpose("lat", "lon").values
+            candidate_masks.append(np.isfinite(values))
+
+    if not candidate_masks:
+        raise ValueError("No spatial data layers were found in the dataset.")
+
+    return np.logical_or.reduce(candidate_masks)
+
+
 def load_viewer_data(dataset_path: Path, parameters_path: Path) -> ViewerData:
     if not dataset_path.exists():
-        raise FileNotFoundError(
-            f"AOI dataset was not found: {dataset_path}. "
-            "Run clip_insar_to_aoi.py first or pass a project folder with results_tight.nc."
-        )
+        raise FileNotFoundError(f"Dataset was not found: {dataset_path}")
 
-    with xr.open_dataset(dataset_path) as dataset:
-        dataset = dataset.load()
-
-    variables = tuple(name for name in DISPLACEMENT_VARIABLES if name in dataset.data_vars)
-    if not variables:
-        raise ValueError("No displacement variables found in the AOI dataset.")
-
-    if "date" not in dataset.coords or "lat" not in dataset.coords or "lon" not in dataset.coords:
-        raise ValueError("Dataset must contain date, lat, and lon coordinates.")
-
-    latitudes = dataset["lat"].values
-    longitudes = dataset["lon"].values
-    dates = pd.DatetimeIndex(pd.to_datetime(dataset["date"].values))
     parameters = load_parameters(parameters_path)
     aoi_coordinates = parse_polygon_wkt((parameters.get("aoi") or {}).get("raw_wkt"))
     aoi_lons = np.array([lon for lon, _lat in aoi_coordinates]) if aoi_coordinates else None
     aoi_lats = np.array([lat for _lon, lat in aoi_coordinates]) if aoi_coordinates else None
 
-    if "aoi_mask" in dataset:
-        mask = dataset["aoi_mask"].values.astype(bool)
-    elif aoi_coordinates:
-        polygon_mask = make_polygon_mask(longitudes, latitudes, aoi_coordinates)
-        if polygon_mask is not None:
-            mask = polygon_mask
-        else:
-            first_variable = dataset[variables[0]].transpose("date", "lat", "lon").values
-            mask = np.isfinite(first_variable).any(axis=0)
-    else:
-        first_variable = dataset[variables[0]].transpose("date", "lat", "lon").values
-        mask = np.isfinite(first_variable).any(axis=0)
+    with xr.open_dataset(dataset_path) as dataset:
+        dataset = dataset.load()
 
-    pixel_rows, pixel_cols = np.where(mask)
+    if "lat" not in dataset.coords or "lon" not in dataset.coords:
+        raise ValueError("Dataset must contain lat and lon coordinates.")
+
+    latitudes = dataset["lat"].values
+    longitudes = dataset["lon"].values
+    spatial_mask = build_spatial_mask(dataset, latitudes, longitudes, aoi_coordinates)
+    pixel_rows, pixel_cols = np.where(spatial_mask)
     if len(pixel_rows) == 0:
-        raise ValueError("AOI mask contains no valid pixels.")
+        raise ValueError("No pixels are available inside the selected spatial mask.")
+
+    layer_specs = tuple(
+        spec
+        for spec in REQUESTED_DATA_LAYERS
+        if spec.kind == "aoi" or (spec.variable is not None and spec.variable in dataset.data_vars)
+    )
+
+    layer_values: dict[str, np.ndarray] = {}
+    for spec in layer_specs:
+        if spec.variable is None:
+            continue
+        values = dataset[spec.variable].transpose("lat", "lon").values
+        layer_values[spec.key] = values[pixel_rows, pixel_cols]
+
+    if "date" in dataset.coords:
+        dates = pd.DatetimeIndex(pd.to_datetime(dataset["date"].values))
+    else:
+        dates = pd.DatetimeIndex([])
+
+    displacement_series: dict[str, np.ndarray] = {}
+    displacement_labels: dict[str, str] = {}
+    for variable, label in DISPLACEMENT_VARIABLES:
+        if variable not in dataset.data_vars or "date" not in dataset[variable].dims:
+            continue
+        values = dataset[variable].transpose("date", "lat", "lon").values
+        displacement_series[variable] = values[:, pixel_rows, pixel_cols].T
+        displacement_labels[variable] = label
 
     pixel_lats = latitudes[pixel_rows]
     pixel_lons = longitudes[pixel_cols]
 
-    series_by_variable: dict[str, np.ndarray] = {}
-    rmse_by_variable: dict[str, np.ndarray] = {}
-    rmse_ranges: dict[str, tuple[float, float]] = {}
-    for variable in variables:
-        values = dataset[variable].transpose("date", "lat", "lon").values
-        series_by_variable[variable] = values[:, pixel_rows, pixel_cols].T
-
-        rmse_variable = QUALITY_VARIABLES.get(variable)
-        if rmse_variable in dataset.data_vars:
-            rmse_values = dataset[rmse_variable].transpose("lat", "lon").values[
-                pixel_rows,
-                pixel_cols,
-            ]
-            rmse_by_variable[variable] = rmse_values
-            finite_rmse = rmse_values[np.isfinite(rmse_values)]
-            if finite_rmse.size:
-                rmse_ranges[variable] = (
-                    float(np.nanmin(finite_rmse)),
-                    float(np.nanmax(finite_rmse)),
-                )
-
-    default_variable = variables[0]
-    default_series = series_by_variable[default_variable]
-    finite_series_candidates = np.flatnonzero(np.isfinite(default_series).any(axis=1))
-    default_rmse = rmse_by_variable.get(default_variable)
-    if default_rmse is not None:
-        rmse_candidates = np.flatnonzero(
-            np.isfinite(default_rmse) & (default_rmse <= DEFAULT_RMSE_THRESHOLD)
-        )
-        default_candidates = np.intersect1d(rmse_candidates, finite_series_candidates)
-    else:
-        default_candidates = finite_series_candidates
-
-    if len(default_candidates) == 0:
-        default_candidates = (
-            finite_series_candidates
-            if len(finite_series_candidates)
-            else np.arange(len(pixel_lons))
-        )
+    default_candidates = np.arange(len(pixel_lons))
+    masked_velocity = layer_values.get("sbas_velocity_masked")
+    if masked_velocity is not None and np.isfinite(masked_velocity).any():
+        default_candidates = np.flatnonzero(np.isfinite(masked_velocity))
 
     default_selected_ids = [int(default_candidates[0])] if len(default_candidates) else []
     pois = parameters.get("pois") or []
@@ -234,440 +394,72 @@ def load_viewer_data(dataset_path: Path, parameters_path: Path) -> ViewerData:
                 )
             ]
 
+    title = str(dataset.attrs.get("title") or dataset_path.stem)
     return ViewerData(
         dataset_path=dataset_path,
         parameters_path=parameters_path,
-        aoi_lons=aoi_lons,
-        aoi_lats=aoi_lats,
-        variables=variables,
+        title=title,
         dates=dates,
-        latitudes=latitudes,
-        longitudes=longitudes,
-        pixel_rows=pixel_rows,
-        pixel_cols=pixel_cols,
         pixel_lats=pixel_lats,
         pixel_lons=pixel_lons,
-        series_by_variable=series_by_variable,
-        rmse_by_variable=rmse_by_variable,
-        rmse_ranges=rmse_ranges,
+        pixel_rows=pixel_rows,
+        pixel_cols=pixel_cols,
+        layer_values=layer_values,
+        layer_specs=layer_specs,
+        displacement_series=displacement_series,
+        displacement_labels=displacement_labels,
+        aoi_lons=aoi_lons,
+        aoi_lats=aoi_lats,
+        center_lat=float(np.nanmean(pixel_lats)),
+        center_lon=float(np.nanmean(pixel_lons)),
         default_selected_ids=default_selected_ids,
     )
 
 
-def default_dataset_path(project_paths: ProjectPaths) -> Path:
-    candidates = (
-        project_paths.aoi_output_dir / "results_aoi_masked.nc",
-        project_paths.product_dir / "results_tight.nc",
-        project_paths.product_dir / "results_wide.nc",
-    )
-    for path in candidates:
-        if path.exists():
-            return path
-
-    nc_files = find_netcdf_files(project_paths)
-    if nc_files:
-        return nc_files[0]
-
-    raise FileNotFoundError(
-        f"No NetCDF dataset found under product folder: {project_paths.product_dir}"
-    )
+def opacity_to_float(value) -> float:
+    if value is None:
+        return 1.0
+    return max(0.0, min(1.0, float(value) / 100.0))
 
 
-def finite_color_range(values: np.ndarray) -> tuple[float, float]:
-    finite = values[np.isfinite(values)]
-    if finite.size == 0:
-        return -1.0, 1.0
-
-    max_abs = float(np.nanmax(np.abs(finite)))
-    if max_abs == 0:
-        max_abs = 1.0
-
-    return -max_abs, max_abs
-
-
-def finite_mean_by_column(values: np.ndarray) -> np.ndarray:
-    finite = np.isfinite(values)
-    counts = finite.sum(axis=0)
-    sums = np.where(finite, values, 0.0).sum(axis=0)
-    means = np.full(values.shape[1], np.nan, dtype="float64")
-    valid_columns = counts > 0
-    means[valid_columns] = sums[valid_columns] / counts[valid_columns]
-    return means
-
-
-def quality_pixel_ids(
-    variable: str,
-    apply_quality_mask: bool,
-    rmse_threshold: float | None,
-) -> np.ndarray:
-    total_pixels = len(VIEWER_DATA.pixel_lons)
-    if not apply_quality_mask:
-        return np.arange(total_pixels)
-
-    rmse_values = VIEWER_DATA.rmse_by_variable.get(variable)
-    if rmse_values is None:
-        return np.arange(total_pixels)
-
-    threshold = DEFAULT_RMSE_THRESHOLD if rmse_threshold is None else float(rmse_threshold)
-    return np.flatnonzero(np.isfinite(rmse_values) & (rmse_values <= threshold))
-
-
-def clean_selected_ids(selected_ids: list[int], allowed_ids: np.ndarray) -> list[int]:
-    allowed = set(int(pixel_id) for pixel_id in allowed_ids)
-    return sorted(
-        {
-            int(pixel_id)
-            for pixel_id in selected_ids
-            if int(pixel_id) in allowed
+def enabled_dict(keys: list[str], checklist_values: list[list[str]], opacity_values: list[float]) -> dict:
+    states = {}
+    for index, key in enumerate(keys):
+        selected_values = checklist_values[index] if index < len(checklist_values) else []
+        opacity = opacity_values[index] if index < len(opacity_values) else 100
+        states[key] = {
+            "enabled": key in (selected_values or []),
+            "opacity": opacity_to_float(opacity),
         }
-    )
+    return states
 
 
-def build_map_figure(
-    variable: str,
-    date_index: int,
-    selected_ids: list[int],
-    apply_quality_mask: bool,
-    rmse_threshold: float | None,
-) -> go.Figure:
-    series = VIEWER_DATA.series_by_variable[variable]
-    visible_ids = quality_pixel_ids(variable, apply_quality_mask, rmse_threshold)
-    values = series[visible_ids, date_index]
-    finite_values = np.isfinite(values)
-    visible_ids = visible_ids[finite_values]
-    values = values[finite_values]
-    color_min, color_max = finite_color_range(values)
-    selected_ids_clean = clean_selected_ids(selected_ids, visible_ids)
-
-    figure = go.Figure()
-    figure.add_trace(
-        go.Scattergl(
-            x=VIEWER_DATA.pixel_lons[visible_ids],
-            y=VIEWER_DATA.pixel_lats[visible_ids],
-            mode="markers",
-            customdata=visible_ids.tolist(),
-            marker={
-                "size": 7,
-                "color": values,
-                "colorscale": "RdBu_r",
-                "cmin": color_min,
-                "cmax": color_max,
-                "colorbar": {
-                    "title": "mm",
-                    "thickness": 14,
-                    "len": 0.82,
-                },
-                "line": {"width": 0},
-            },
-            hovertemplate=(
-                "lon=%{x:.6f}<br>"
-                "lat=%{y:.6f}<br>"
-                "deformation=%{marker.color:.2f} mm"
-                "<extra></extra>"
-            ),
-            name="AOI pixels",
-        )
-    )
-
-    if VIEWER_DATA.aoi_lons is not None and VIEWER_DATA.aoi_lats is not None:
-        figure.add_trace(
-            go.Scatter(
-                x=VIEWER_DATA.aoi_lons,
-                y=VIEWER_DATA.aoi_lats,
-                mode="lines",
-                line={"color": "#172126", "width": 2},
-                hoverinfo="skip",
-                showlegend=False,
-                name="AOI outline",
-            )
-        )
-
-    if selected_ids_clean:
-        figure.add_trace(
-            go.Scattergl(
-                x=VIEWER_DATA.pixel_lons[selected_ids_clean],
-                y=VIEWER_DATA.pixel_lats[selected_ids_clean],
-                mode="markers",
-                marker={
-                    "size": 11,
-                    "color": "rgba(0, 0, 0, 0)",
-                    "line": {"color": "#101820", "width": 2},
-                },
-                hoverinfo="skip",
-                showlegend=False,
-                name="Selected pixels",
-            )
-        )
-
-    figure.update_layout(
-        margin={"l": 38, "r": 20, "t": 34, "b": 38},
-        paper_bgcolor=PANEL_BG,
-        plot_bgcolor=PANEL_BG,
-        dragmode="lasso",
-        clickmode="event+select",
-        uirevision=f"{variable}-{date_index}-{apply_quality_mask}-{rmse_threshold}",
-        title={
-            "text": f"{VARIABLE_LABELS.get(variable, variable)} on {VIEWER_DATA.dates[date_index].date()}",
-            "font": {"size": 15, "color": TEXT_MAIN},
-        },
-        xaxis={
-            "title": "Longitude (W negative)",
-            "showgrid": True,
-            "gridcolor": "#e6ecef",
-            "zeroline": False,
-        },
-        yaxis={
-            "title": "Latitude (S negative)",
-            "showgrid": True,
-            "gridcolor": "#e6ecef",
-            "zeroline": False,
-            "scaleanchor": "x",
-            "scaleratio": 1,
-        },
-        font={"family": "Segoe UI, Arial, sans-serif", "color": TEXT_MAIN},
-    )
-
-    return figure
+def rgba(hex_color: str, opacity: float) -> str:
+    hex_value = hex_color.lstrip("#")
+    red = int(hex_value[0:2], 16)
+    green = int(hex_value[2:4], 16)
+    blue = int(hex_value[4:6], 16)
+    return f"rgba({red},{green},{blue},{opacity:.3f})"
 
 
-def series_lines_for_pixels(series: np.ndarray, selected_ids: list[int]) -> tuple[list, list]:
-    dates = list(VIEWER_DATA.dates)
-    x_values: list = []
-    y_values: list = []
-
-    for pixel_id in selected_ids:
-        if pixel_id < 0 or pixel_id >= series.shape[0]:
+def mapbox_tile_layers(base_states: dict) -> list[dict]:
+    layers = []
+    for spec in BASEMAP_SPECS:
+        state = base_states.get(spec.key, {})
+        if not state.get("enabled"):
             continue
-        x_values.extend(dates)
-        x_values.append(None)
-        y_values.extend(series[pixel_id].tolist())
-        y_values.append(None)
-
-    return x_values, y_values
-
-
-def build_timeseries_figure(
-    variable: str,
-    selected_ids: list[int],
-    apply_quality_mask: bool,
-    rmse_threshold: float | None,
-) -> go.Figure:
-    series = VIEWER_DATA.series_by_variable[variable]
-    visible_ids = quality_pixel_ids(variable, apply_quality_mask, rmse_threshold)
-    selected_ids_clean = clean_selected_ids(selected_ids, visible_ids)
-
-    figure = go.Figure()
-
-    if not selected_ids_clean:
-        figure.update_layout(
-            annotations=[
-                {
-                    "text": "No pixels selected",
-                    "xref": "paper",
-                    "yref": "paper",
-                    "x": 0.5,
-                    "y": 0.5,
-                    "showarrow": False,
-                    "font": {"size": 15, "color": TEXT_MUTED},
-                }
-            ]
+        layers.append(
+            {
+                "sourcetype": "raster",
+                "source": [spec.url],
+                "below": "traces",
+                "opacity": state.get("opacity", spec.default_opacity),
+            }
         )
-    else:
-        x_lines, y_lines = series_lines_for_pixels(series, selected_ids_clean)
-        selected_series = series[selected_ids_clean, :]
-        if not np.isfinite(selected_series).any():
-            figure.update_layout(
-                annotations=[
-                    {
-                        "text": "Selected pixels have no finite samples",
-                        "xref": "paper",
-                        "yref": "paper",
-                        "x": 0.5,
-                        "y": 0.5,
-                        "showarrow": False,
-                        "font": {"size": 15, "color": TEXT_MUTED},
-                    }
-                ]
-            )
-            selected_ids_clean = []
-        else:
-            mean_series = finite_mean_by_column(selected_series)
-
-            figure.add_trace(
-                go.Scattergl(
-                    x=x_lines,
-                    y=y_lines,
-                    mode="lines",
-                    line={"color": "rgba(80, 88, 94, 0.22)", "width": 1},
-                    hoverinfo="skip",
-                    name="Selected pixels",
-                )
-            )
-            figure.add_trace(
-                go.Scatter(
-                    x=VIEWER_DATA.dates,
-                    y=mean_series,
-                    mode="lines+markers",
-                    line={"color": APP_ACCENT, "width": 4},
-                    marker={"size": 7, "color": APP_ACCENT},
-                    hovertemplate="date=%{x|%Y-%m-%d}<br>mean=%{y:.2f} mm<extra></extra>",
-                    name="Mean",
-                )
-            )
-
-    figure.update_layout(
-        margin={"l": 58, "r": 22, "t": 34, "b": 48},
-        paper_bgcolor=PANEL_BG,
-        plot_bgcolor=PANEL_BG,
-        title={
-            "text": f"{VARIABLE_LABELS.get(variable, variable)} time series",
-            "font": {"size": 15, "color": TEXT_MAIN},
-        },
-        xaxis={
-            "title": "Date",
-            "showgrid": True,
-            "gridcolor": "#e6ecef",
-            "zeroline": False,
-        },
-        yaxis={
-            "title": "Deformation (mm)",
-            "showgrid": True,
-            "gridcolor": "#e6ecef",
-            "zeroline": True,
-            "zerolinecolor": "#9aa7ad",
-        },
-        legend={
-            "orientation": "h",
-            "yanchor": "bottom",
-            "y": 1.02,
-            "xanchor": "right",
-            "x": 1,
-        },
-        font={"family": "Segoe UI, Arial, sans-serif", "color": TEXT_MAIN},
-    )
-
-    return figure
+    return layers
 
 
-def build_selection_summary(
-    variable: str,
-    selected_ids: list[int],
-    apply_quality_mask: bool,
-    rmse_threshold: float | None,
-) -> list:
-    series = VIEWER_DATA.series_by_variable[variable]
-    visible_ids = quality_pixel_ids(variable, apply_quality_mask, rmse_threshold)
-    selected_ids_clean = clean_selected_ids(selected_ids, visible_ids)
-    total_pixels = len(VIEWER_DATA.pixel_lons)
-    rmse_range = VIEWER_DATA.rmse_ranges.get(variable)
-    if apply_quality_mask and rmse_range is not None:
-        threshold = DEFAULT_RMSE_THRESHOLD if rmse_threshold is None else float(rmse_threshold)
-        quality_text = f"{len(visible_ids):,} / {total_pixels:,}"
-        threshold_text = f"RMSE <= {threshold:.2f} mm"
-    elif rmse_range is not None:
-        quality_text = f"{total_pixels:,} / {total_pixels:,}"
-        threshold_text = "RMSE mask off"
-    else:
-        quality_text = f"{total_pixels:,} / {total_pixels:,}"
-        threshold_text = "No RMSE layer"
-
-    if not selected_ids_clean:
-        return [
-            html.Div(
-                [
-                    html.Div("Selected pixels", className="summary-label"),
-                    html.Div("0", className="summary-value"),
-                ],
-                className="summary-item",
-            ),
-            html.Div(
-                [
-                    html.Div("Quality pixels", className="summary-label"),
-                    html.Div(quality_text, className="summary-value"),
-                ],
-                className="summary-item",
-            ),
-            html.Div(
-                [
-                    html.Div("Quality rule", className="summary-label"),
-                    html.Div(threshold_text, className="summary-value"),
-                ],
-                className="summary-item",
-            ),
-        ]
-
-    selected_series = series[selected_ids_clean, :]
-    if not np.isfinite(selected_series).any():
-        return [
-            html.Div(
-                [
-                    html.Div("Selected pixels", className="summary-label"),
-                    html.Div(f"{len(selected_ids_clean):,}", className="summary-value"),
-                ],
-                className="summary-item",
-            ),
-            html.Div(
-                [
-                    html.Div("Finite samples", className="summary-label"),
-                    html.Div("0", className="summary-value"),
-                ],
-                className="summary-item",
-            ),
-            html.Div(
-                [
-                    html.Div("Quality pixels", className="summary-label"),
-                    html.Div(quality_text, className="summary-value"),
-                ],
-                className="summary-item",
-            ),
-            html.Div(
-                [
-                    html.Div("Quality rule", className="summary-label"),
-                    html.Div(threshold_text, className="summary-value"),
-                ],
-                className="summary-item",
-            ),
-        ]
-
-    mean_series = finite_mean_by_column(selected_series)
-    finite_mean = mean_series[np.isfinite(mean_series)]
-    latest_mean = float(finite_mean[-1])
-    min_mean = float(finite_mean.min())
-    max_mean = float(finite_mean.max())
-
-    return [
-        html.Div(
-            [
-                html.Div("Selected pixels", className="summary-label"),
-                html.Div(f"{len(selected_ids_clean):,}", className="summary-value"),
-            ],
-            className="summary-item",
-        ),
-        html.Div(
-            [
-                html.Div("Latest mean", className="summary-label"),
-                html.Div(f"{latest_mean:.2f} mm", className="summary-value"),
-            ],
-            className="summary-item",
-        ),
-        html.Div(
-            [
-                html.Div("Mean range", className="summary-label"),
-                html.Div(f"{min_mean:.2f} to {max_mean:.2f} mm", className="summary-value"),
-            ],
-            className="summary-item",
-        ),
-        html.Div(
-            [
-                html.Div("Quality pixels", className="summary-label"),
-                html.Div(quality_text, className="summary-value"),
-            ],
-            className="summary-item",
-        ),
-    ]
-
-
-def extract_ids_from_points(points: list[dict]) -> list[int]:
+def selected_ids_from_points(points: list[dict]) -> list[int]:
     ids = []
     for point in points:
         customdata = point.get("customdata")
@@ -682,126 +474,365 @@ def extract_ids_from_points(points: list[dict]) -> list[int]:
     return sorted(set(ids))
 
 
+def clean_selected_ids(selected_ids: list[int]) -> list[int]:
+    total = len(VIEWER_DATA.pixel_lons)
+    return sorted({int(pixel_id) for pixel_id in selected_ids if 0 <= int(pixel_id) < total})
+
+
+def add_aoi_trace(figure: go.Figure, opacity: float) -> None:
+    if VIEWER_DATA.aoi_lons is None or VIEWER_DATA.aoi_lats is None:
+        return
+
+    figure.add_trace(
+        go.Scattermapbox(
+            lon=VIEWER_DATA.aoi_lons,
+            lat=VIEWER_DATA.aoi_lats,
+            mode="lines",
+            line={"color": rgba("#ffcc33", opacity), "width": 3},
+            fill="toself",
+            fillcolor=rgba("#ffcc33", opacity * 0.08),
+            hoverinfo="skip",
+            showlegend=False,
+            name="AOI (original)",
+        )
+    )
+
+
+def add_data_layer_trace(
+    figure: go.Figure,
+    spec: DataLayerSpec,
+    values: np.ndarray,
+    opacity: float,
+    colorbar_index: int,
+) -> int:
+    if spec.kind == "mask":
+        finite = np.isfinite(values)
+        marker_size = 6
+        cmin, cmax = 0, 1
+    else:
+        finite = np.isfinite(values)
+        marker_size = 6
+        cmin, cmax = finite_color_range(values[finite], symmetric=spec.key.startswith("sbas_velocity"))
+
+    if not finite.any():
+        return colorbar_index
+
+    pixel_ids = np.flatnonzero(finite)
+    colorbar_y = max(0.18, 0.86 - (colorbar_index * 0.24))
+    customdata = np.column_stack([pixel_ids, values[finite]])
+
+    figure.add_trace(
+        go.Scattermapbox(
+            lon=VIEWER_DATA.pixel_lons[finite],
+            lat=VIEWER_DATA.pixel_lats[finite],
+            mode="markers",
+            customdata=customdata,
+            marker={
+                "size": marker_size,
+                "color": values[finite],
+                "colorscale": spec.colorscale,
+                "cmin": cmin,
+                "cmax": cmax,
+                "opacity": opacity,
+                "colorbar": {
+                    "title": spec.units,
+                    "thickness": 12,
+                    "len": 0.22,
+                    "y": colorbar_y,
+                    "x": 1.01,
+                },
+            },
+            hovertemplate=(
+                f"<b>{spec.label}</b><br>"
+                "lon=%{lon:.6f}<br>"
+                "lat=%{lat:.6f}<br>"
+                f"value=%{{customdata[1]:.3f}} {spec.units}"
+                "<extra></extra>"
+            ),
+            showlegend=False,
+            name=spec.label,
+        )
+    )
+    return colorbar_index + 1
+
+
+def build_map_figure(base_states: dict, data_states: dict, selected_ids: list[int]) -> go.Figure:
+    figure = go.Figure()
+    colorbar_index = 0
+
+    for spec in VIEWER_DATA.layer_specs:
+        state = data_states.get(spec.key, {})
+        if not state.get("enabled"):
+            continue
+
+        opacity = state.get("opacity", spec.default_opacity)
+        if spec.kind == "aoi":
+            add_aoi_trace(figure, opacity)
+            continue
+
+        values = VIEWER_DATA.layer_values.get(spec.key)
+        if values is None:
+            continue
+        colorbar_index = add_data_layer_trace(figure, spec, values, opacity, colorbar_index)
+
+    selected_ids_clean = clean_selected_ids(selected_ids)
+    if selected_ids_clean:
+        selected_customdata = np.array(selected_ids_clean, dtype=int)
+        figure.add_trace(
+            go.Scattermapbox(
+                lon=VIEWER_DATA.pixel_lons[selected_ids_clean],
+                lat=VIEWER_DATA.pixel_lats[selected_ids_clean],
+                mode="markers",
+                customdata=selected_customdata,
+                marker={
+                    "size": 14,
+                    "color": "#111820",
+                    "opacity": 0.85,
+                },
+                hoverinfo="skip",
+                showlegend=False,
+                name="Selected pixel halo",
+            )
+        )
+        figure.add_trace(
+            go.Scattermapbox(
+                lon=VIEWER_DATA.pixel_lons[selected_ids_clean],
+                lat=VIEWER_DATA.pixel_lats[selected_ids_clean],
+                mode="markers",
+                customdata=selected_customdata,
+                marker={"size": 7, "color": "#ffcc33", "opacity": 1.0},
+                hovertemplate=(
+                    "<b>Selected pixel</b><br>"
+                    "lon=%{lon:.6f}<br>"
+                    "lat=%{lat:.6f}"
+                    "<extra></extra>"
+                ),
+                showlegend=False,
+                name="Selected pixels",
+            )
+        )
+
+    figure.update_layout(
+        margin={"l": 0, "r": 0, "t": 0, "b": 0},
+        paper_bgcolor=PANEL_BG,
+        plot_bgcolor=PANEL_BG,
+        clickmode="event+select",
+        uirevision="insar-map",
+        mapbox={
+            "style": "white-bg",
+            "center": {"lat": VIEWER_DATA.center_lat, "lon": VIEWER_DATA.center_lon},
+            "zoom": DEFAULT_ZOOM,
+            "layers": mapbox_tile_layers(base_states),
+        },
+        font={"family": "Segoe UI, Arial, sans-serif", "color": TEXT_MAIN},
+    )
+    return figure
+
+
+def build_timeseries_figure(selected_ids: list[int]) -> go.Figure:
+    selected_ids_clean = clean_selected_ids(selected_ids)
+    figure = go.Figure()
+
+    if not selected_ids_clean or not VIEWER_DATA.displacement_series:
+        figure.update_layout(
+            annotations=[
+                {
+                    "text": "Click a data pixel to inspect its displacement history",
+                    "xref": "paper",
+                    "yref": "paper",
+                    "x": 0.5,
+                    "y": 0.5,
+                    "showarrow": False,
+                    "font": {"size": 14, "color": TEXT_MUTED},
+                }
+            ]
+        )
+    else:
+        colors = {
+            "sbas_displacement_raw": "#38598c",
+            "sbas_displacement_masked": "#126a65",
+            "sbas_displacement_segmented_same_pixel": "#9b5de5",
+            "displacement_sbas": "#126a65",
+        }
+        for variable, series in VIEWER_DATA.displacement_series.items():
+            selected_series = series[selected_ids_clean, :]
+            if not np.isfinite(selected_series).any():
+                continue
+            mean_series = finite_mean_by_column(selected_series)
+            figure.add_trace(
+                go.Scatter(
+                    x=VIEWER_DATA.dates,
+                    y=mean_series,
+                    mode="lines+markers",
+                    line={"color": colors.get(variable, APP_ACCENT), "width": 3},
+                    marker={"size": 7, "color": colors.get(variable, APP_ACCENT)},
+                    hovertemplate="date=%{x|%Y-%m-%d}<br>displacement=%{y:.2f} mm<extra></extra>",
+                    name=VIEWER_DATA.displacement_labels.get(variable, variable),
+                )
+            )
+
+    figure.update_layout(
+        margin={"l": 58, "r": 18, "t": 28, "b": 46},
+        paper_bgcolor=PANEL_BG,
+        plot_bgcolor=PANEL_BG,
+        xaxis={
+            "title": "Date",
+            "showgrid": True,
+            "gridcolor": "#e6ecef",
+            "zeroline": False,
+        },
+        yaxis={
+            "title": "LOS displacement (mm)",
+            "showgrid": True,
+            "gridcolor": "#e6ecef",
+            "zeroline": True,
+            "zerolinecolor": "#9aa7ad",
+        },
+        legend={"orientation": "h", "y": 1.08, "x": 0},
+        font={"family": "Segoe UI, Arial, sans-serif", "color": TEXT_MAIN},
+    )
+    return figure
+
+
+def selected_pixel_cards(selected_ids: list[int]) -> list:
+    selected_ids_clean = clean_selected_ids(selected_ids)
+    if not selected_ids_clean:
+        return [
+            html.Div("No pixel selected", className="empty-state"),
+        ]
+
+    pixel_id = selected_ids_clean[-1]
+    cards = [
+        metric_card("Selected pixels", f"{len(selected_ids_clean):,}"),
+        metric_card("Longitude", f"{VIEWER_DATA.pixel_lons[pixel_id]:.6f}"),
+        metric_card("Latitude", f"{VIEWER_DATA.pixel_lats[pixel_id]:.6f}"),
+    ]
+
+    for spec in VIEWER_DATA.layer_specs:
+        if spec.kind == "aoi" or spec.key not in VIEWER_DATA.layer_values:
+            continue
+        value = VIEWER_DATA.layer_values[spec.key][pixel_id]
+        text = "no data" if not np.isfinite(value) else f"{value:.3f} {spec.units}".strip()
+        cards.append(metric_card(spec.label, text))
+
+    return cards
+
+
+def metric_card(label: str, value: str) -> html.Div:
+    return html.Div(
+        [
+            html.Div(label, className="metric-label"),
+            html.Div(value, className="metric-value"),
+        ],
+        className="metric",
+    )
+
+
+def layer_row(spec, group: str) -> html.Div:
+    default_value = [spec.key] if spec.default_enabled else []
+    default_opacity = int(round(spec.default_opacity * 100))
+    return html.Div(
+        [
+            html.Div(
+                [
+                    dcc.Checklist(
+                        id={"type": f"{group}-toggle", "key": spec.key},
+                        options=[{"label": spec.label, "value": spec.key}],
+                        value=default_value,
+                        className="layer-toggle",
+                    ),
+                    html.Div(f"{default_opacity}%", className="opacity-readout"),
+                ],
+                className="layer-row-top",
+            ),
+            dcc.Slider(
+                id={"type": f"{group}-opacity", "key": spec.key},
+                min=0,
+                max=100,
+                step=5,
+                value=default_opacity,
+                marks=None,
+                tooltip={"placement": "bottom", "always_visible": False},
+                className="opacity-slider",
+            ),
+        ],
+        className="layer-row",
+    )
+
+
 def make_app() -> Dash:
     if VIEWER_DATA is None:
         raise RuntimeError("Viewer data has not been loaded.")
 
     app = Dash(__name__)
-    app.title = "InSAR AOI Deformation Viewer"
-
-    variable_options = [
-        {"label": VARIABLE_LABELS.get(variable, variable), "value": variable}
-        for variable in VIEWER_DATA.variables
-    ]
-    date_options = [
-        {"label": date.strftime("%Y-%m-%d"), "value": index}
-        for index, date in enumerate(VIEWER_DATA.dates)
-    ]
+    app.title = "InSAR SBAS Layer Viewer"
 
     app.layout = html.Div(
         [
             dcc.Store(id="selection-store", data=VIEWER_DATA.default_selected_ids),
-            html.Div(
+            html.Aside(
                 [
                     html.Div(
                         [
-                            html.H1("AOI Deformation Explorer"),
-                            html.Div(
-                                f"Dataset: {VIEWER_DATA.dataset_path.name}",
-                                className="subtle-text",
-                            ),
+                            html.H1("SBAS Layer Viewer"),
+                            html.Div(VIEWER_DATA.dataset_path.name, className="subtle-text"),
                         ],
-                        className="title-block",
+                        className="sidebar-header",
                     ),
-                    html.Div(
+                    html.Details(
                         [
-                            html.Div(
-                                [
-                                    html.Label("Displacement source"),
-                                    dcc.Dropdown(
-                                        id="variable-dropdown",
-                                        options=variable_options,
-                                        value=VIEWER_DATA.variables[0],
-                                        clearable=False,
-                                    ),
-                                ],
-                                className="control-group",
-                            ),
-                            html.Div(
-                                [
-                                    html.Label("Map date"),
-                                    dcc.Dropdown(
-                                        id="date-dropdown",
-                                        options=date_options,
-                                        value=len(VIEWER_DATA.dates) - 1,
-                                        clearable=False,
-                                    ),
-                                ],
-                                className="date-control",
-                            ),
-                            html.Div(
-                                [
-                                    html.Label("Quality mask"),
-                                    dcc.Checklist(
-                                        id="quality-mask-toggle",
-                                        options=[
-                                            {
-                                                "label": "Use RMSE mask",
-                                                "value": "rmse",
-                                            }
-                                        ],
-                                        value=["rmse"],
-                                        className="quality-checklist",
-                                    ),
-                                ],
-                                className="quality-control",
-                            ),
-                            html.Div(
-                                [
-                                    html.Label("Max RMSE"),
-                                    dcc.Input(
-                                        id="rmse-threshold",
-                                        type="number",
-                                        value=DEFAULT_RMSE_THRESHOLD,
-                                        min=0,
-                                        step=0.01,
-                                        className="number-input",
-                                    ),
-                                ],
-                                className="rmse-control",
-                            ),
-                            html.Button("Clear selection", id="clear-selection", n_clicks=0),
+                            html.Summary("Ground Maps"),
+                            html.Div([layer_row(spec, "base") for spec in BASEMAP_SPECS]),
                         ],
-                        className="controls",
+                        open=True,
+                        className="layer-menu",
                     ),
+                    html.Details(
+                        [
+                            html.Summary("Data Overlays"),
+                            html.Div([layer_row(spec, "data") for spec in VIEWER_DATA.layer_specs]),
+                        ],
+                        open=True,
+                        className="layer-menu",
+                    ),
+                    html.Button("Clear selection", id="clear-selection", n_clicks=0, className="secondary-button"),
                 ],
-                className="topbar",
+                className="sidebar",
             ),
-            html.Div(id="selection-summary", className="summary-strip"),
-            html.Div(
+            html.Main(
                 [
-                    html.Div(
+                    html.Section(
                         dcc.Graph(
-                            id="deformation-map",
+                            id="layer-map",
                             config={
                                 "displaylogo": False,
-                                "modeBarButtonsToAdd": ["lasso2d", "select2d"],
-                                "toImageButtonOptions": {"filename": "aoi_deformation_map"},
+                                "scrollZoom": True,
+                                "toImageButtonOptions": {"filename": "insar_layer_map"},
                             },
-                            className="graph",
+                            className="map-graph",
                         ),
-                        className="panel map-panel",
+                        className="map-panel",
                     ),
-                    html.Div(
-                        dcc.Graph(
-                            id="timeseries-plot",
-                            config={
-                                "displaylogo": False,
-                                "toImageButtonOptions": {"filename": "aoi_deformation_timeseries"},
-                            },
-                            className="graph",
-                        ),
-                        className="panel series-panel",
+                    html.Aside(
+                        [
+                            html.Div(
+                                [
+                                    html.H2("Pixel Time Series"),
+                                    html.Div(
+                                        f"{len(VIEWER_DATA.displacement_series)} displacement arrays loaded",
+                                        className="subtle-text",
+                                    ),
+                                ],
+                                className="inspector-header",
+                            ),
+                            dcc.Graph(
+                                id="timeseries-plot",
+                                config={"displaylogo": False},
+                                className="timeseries-graph",
+                            ),
+                            html.Div(id="pixel-summary", className="metrics-grid"),
+                        ],
+                        className="inspector",
                     ),
                 ],
                 className="workspace",
@@ -822,153 +853,194 @@ def make_app() -> Dash:
             * { box-sizing: border-box; }
             body {
                 margin: 0;
-                background: #f5f7f8;
+                background: #edf1f2;
                 color: #172126;
                 font-family: "Segoe UI", Arial, sans-serif;
             }
             .app-shell {
-                min-height: 100vh;
-                display: flex;
-                flex-direction: column;
-            }
-            .topbar {
+                height: 100vh;
                 display: grid;
-                grid-template-columns: minmax(260px, 420px) 1fr;
-                gap: 22px;
-                align-items: center;
-                padding: 18px 22px 12px;
-                border-bottom: 1px solid #dce4e7;
-                background: #ffffff;
+                grid-template-columns: 334px minmax(0, 1fr);
+                overflow: hidden;
             }
-            .title-block h1 {
+            .sidebar {
+                min-width: 0;
+                padding: 18px 16px;
+                border-right: 1px solid #d7e0e4;
+                background: #ffffff;
+                overflow: auto;
+            }
+            .sidebar-header {
+                margin-bottom: 18px;
+            }
+            .sidebar-header h1 {
                 margin: 0;
-                font-size: 24px;
-                font-weight: 650;
+                font-size: 22px;
+                font-weight: 700;
                 letter-spacing: 0;
             }
             .subtle-text {
                 margin-top: 4px;
                 color: #5d6970;
                 font-size: 13px;
+                line-height: 1.35;
             }
-            .controls {
-                display: grid;
-                grid-template-columns: minmax(185px, 220px) minmax(150px, 180px) minmax(150px, 170px) minmax(110px, 130px) minmax(140px, 170px);
-                gap: 16px;
-                align-items: end;
+            .layer-menu {
+                margin-bottom: 14px;
+                border: 1px solid #d9e3e7;
+                border-radius: 8px;
+                background: #fbfcfc;
+                overflow: hidden;
             }
-            .control-group label,
-            .date-control label,
-            .quality-control label,
-            .rmse-control label {
-                display: block;
-                margin-bottom: 7px;
-                color: #435058;
-                font-size: 12px;
-                font-weight: 650;
+            .layer-menu summary {
+                padding: 12px 13px;
+                cursor: pointer;
+                color: #1f2b31;
+                font-size: 13px;
+                font-weight: 700;
                 text-transform: uppercase;
+                user-select: none;
             }
-            .date-control {
-                min-width: 0;
+            .layer-row {
+                padding: 10px 12px 12px;
+                border-top: 1px solid #e4ecef;
+                background: #ffffff;
             }
-            .quality-control,
-            .rmse-control {
-                min-width: 0;
+            .layer-row-top {
+                display: flex;
+                justify-content: space-between;
+                gap: 8px;
+                align-items: start;
             }
-            .quality-checklist label {
-                margin: 0;
+            .layer-toggle label {
                 color: #172126;
                 font-size: 13px;
-                font-weight: 600;
-                text-transform: none;
+                font-weight: 620;
+                line-height: 1.3;
+            }
+            .layer-toggle input {
+                margin-right: 8px;
+            }
+            .opacity-readout {
+                color: #6a767d;
+                font-size: 12px;
                 white-space: nowrap;
+                padding-top: 1px;
             }
-            .quality-checklist input {
-                margin-right: 7px;
+            .opacity-slider {
+                margin: 5px 0 0;
             }
-            .number-input {
+            .secondary-button {
                 width: 100%;
                 height: 38px;
-                padding: 0 10px;
                 border: 1px solid #b8c6cb;
-                border-radius: 6px;
-                color: #172126;
-                font: inherit;
-            }
-            #clear-selection {
-                height: 38px;
-                padding: 0 16px;
-                border: 1px solid #b8c6cb;
-                border-radius: 6px;
+                border-radius: 7px;
                 background: #ffffff;
                 color: #172126;
-                font-weight: 650;
+                font-weight: 700;
                 cursor: pointer;
             }
-            #clear-selection:hover {
+            .secondary-button:hover {
                 border-color: #126a65;
                 color: #126a65;
             }
-            .summary-strip {
-                display: flex;
-                gap: 10px;
-                padding: 10px 22px;
-                border-bottom: 1px solid #dce4e7;
-                background: #eef3f4;
-                min-height: 64px;
-            }
-            .summary-item {
-                min-width: 150px;
-                padding: 7px 11px;
-                border: 1px solid #d5e0e4;
-                border-radius: 6px;
-                background: #ffffff;
-            }
-            .summary-label {
-                color: #5d6970;
-                font-size: 12px;
-                font-weight: 650;
-                text-transform: uppercase;
-            }
-            .summary-value {
-                margin-top: 3px;
-                color: #172126;
-                font-size: 18px;
-                font-weight: 700;
-            }
             .workspace {
-                display: grid;
-                grid-template-columns: minmax(420px, 1.02fr) minmax(440px, 0.98fr);
-                gap: 14px;
-                flex: 1;
-                min-height: 0;
-                padding: 14px;
-            }
-            .panel {
                 min-width: 0;
-                min-height: calc(100vh - 190px);
-                border: 1px solid #dce4e7;
+                min-height: 0;
+                display: grid;
+                grid-template-columns: minmax(520px, 1fr) 430px;
+                gap: 12px;
+                padding: 12px;
+            }
+            .map-panel,
+            .inspector {
+                min-width: 0;
+                min-height: 0;
+                border: 1px solid #d7e0e4;
                 border-radius: 8px;
                 background: #ffffff;
                 overflow: hidden;
             }
-            .graph {
+            .map-graph {
                 height: 100%;
-                min-height: calc(100vh - 192px);
+                min-height: calc(100vh - 24px);
             }
-            .Select-control {
-                border-color: #b8c6cb;
-                border-radius: 6px;
+            .inspector {
+                display: grid;
+                grid-template-rows: auto minmax(280px, 42vh) minmax(0, 1fr);
+                overflow: auto;
             }
-            @media (max-width: 1050px) {
-                .topbar,
-                .controls,
+            .inspector-header {
+                padding: 15px 16px 8px;
+                border-bottom: 1px solid #e2eaed;
+            }
+            .inspector-header h2 {
+                margin: 0;
+                font-size: 18px;
+                font-weight: 700;
+            }
+            .timeseries-graph {
+                min-height: 300px;
+                border-bottom: 1px solid #e2eaed;
+            }
+            .metrics-grid {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 9px;
+                padding: 12px;
+            }
+            .metric {
+                min-width: 0;
+                border: 1px solid #dce5e9;
+                border-radius: 7px;
+                background: #fbfcfc;
+                padding: 9px 10px;
+            }
+            .metric-label {
+                color: #5d6970;
+                font-size: 11px;
+                font-weight: 700;
+                line-height: 1.25;
+                text-transform: uppercase;
+            }
+            .metric-value {
+                margin-top: 4px;
+                color: #172126;
+                font-size: 15px;
+                font-weight: 720;
+                overflow-wrap: anywhere;
+            }
+            .empty-state {
+                grid-column: 1 / -1;
+                color: #5d6970;
+                font-size: 14px;
+                padding: 12px 4px;
+            }
+            @media (max-width: 1180px) {
+                .app-shell {
+                    grid-template-columns: 300px minmax(0, 1fr);
+                }
                 .workspace {
                     grid-template-columns: 1fr;
+                    grid-template-rows: minmax(560px, 1fr) minmax(420px, auto);
+                    overflow: auto;
                 }
-                .panel,
-                .graph {
-                    min-height: 520px;
+                .map-graph {
+                    min-height: 560px;
+                }
+            }
+            @media (max-width: 760px) {
+                .app-shell {
+                    display: block;
+                    height: auto;
+                    overflow: auto;
+                }
+                .sidebar {
+                    border-right: 0;
+                    border-bottom: 1px solid #d7e0e4;
+                }
+                .workspace {
+                    padding: 8px;
                 }
             }
         </style>
@@ -986,81 +1058,56 @@ def make_app() -> Dash:
 
     @app.callback(
         Output("selection-store", "data"),
-        Input("deformation-map", "clickData"),
-        Input("deformation-map", "selectedData"),
+        Input("layer-map", "clickData"),
+        Input("layer-map", "selectedData"),
         Input("clear-selection", "n_clicks"),
         State("selection-store", "data"),
         prevent_initial_call=True,
     )
     def update_selection(click_data, selected_data, _clear_clicks, current_selection):
-        triggered = ctx.triggered[0]["prop_id"].split(".")[-1] if ctx.triggered else None
-
         if ctx.triggered_id == "clear-selection":
             return []
 
+        triggered = ctx.triggered[0]["prop_id"].split(".")[-1] if ctx.triggered else None
         if triggered == "clickData" and click_data and click_data.get("points"):
-            ids = extract_ids_from_points(click_data["points"])
+            ids = selected_ids_from_points(click_data["points"])
             return ids[:1] if ids else (current_selection or [])
 
         if triggered == "selectedData" and selected_data and selected_data.get("points"):
-            ids = extract_ids_from_points(selected_data["points"])
+            ids = selected_ids_from_points(selected_data["points"])
             return ids if ids else (current_selection or [])
 
         return current_selection or []
 
     @app.callback(
-        Output("deformation-map", "figure"),
+        Output("layer-map", "figure"),
         Output("timeseries-plot", "figure"),
-        Output("selection-summary", "children"),
-        Input("variable-dropdown", "value"),
-        Input("date-dropdown", "value"),
-        Input("quality-mask-toggle", "value"),
-        Input("rmse-threshold", "value"),
+        Output("pixel-summary", "children"),
+        Input({"type": "base-toggle", "key": ALL}, "value"),
+        Input({"type": "base-opacity", "key": ALL}, "value"),
+        Input({"type": "data-toggle", "key": ALL}, "value"),
+        Input({"type": "data-opacity", "key": ALL}, "value"),
         Input("selection-store", "data"),
     )
-    def update_figures(variable, date_index, quality_mask_values, rmse_threshold, selected_ids):
+    def update_view(
+        base_toggle_values,
+        base_opacity_values,
+        data_toggle_values,
+        data_opacity_values,
+        selected_ids,
+    ):
+        base_keys = [spec.key for spec in BASEMAP_SPECS]
+        data_keys = [spec.key for spec in VIEWER_DATA.layer_specs]
+        base_states = enabled_dict(base_keys, base_toggle_values, base_opacity_values)
+        data_states = enabled_dict(data_keys, data_toggle_values, data_opacity_values)
         selected_ids = selected_ids or []
-        date_index = int(date_index)
-        apply_quality_mask = "rmse" in (quality_mask_values or [])
-        map_figure = build_map_figure(
-            variable,
-            date_index,
-            selected_ids,
-            apply_quality_mask,
-            rmse_threshold,
+        return (
+            build_map_figure(base_states, data_states, selected_ids),
+            build_timeseries_figure(selected_ids),
+            selected_pixel_cards(selected_ids),
         )
-        timeseries_figure = build_timeseries_figure(
-            variable,
-            selected_ids,
-            apply_quality_mask,
-            rmse_threshold,
-        )
-        selection_summary = build_selection_summary(
-            variable,
-            selected_ids,
-            apply_quality_mask,
-            rmse_threshold,
-        )
-        return map_figure, timeseries_figure, selection_summary
 
     return app
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    add_project_dir_argument(parser)
-    parser.add_argument(
-        "--dataset",
-        type=Path,
-        help=(
-            "NetCDF dataset to view. Defaults to aoi_only/results_aoi_masked.nc "
-            "when present, otherwise results_tight.nc."
-        ),
-    )
-    parser.add_argument("--host", default="127.0.0.1", help="Dash host.")
-    parser.add_argument("--port", type=int, default=8050, help="Dash port.")
-    parser.add_argument("--debug", action="store_true", help="Run Dash in debug mode.")
-    return parser.parse_args()
 
 
 if __name__ == "__main__":
