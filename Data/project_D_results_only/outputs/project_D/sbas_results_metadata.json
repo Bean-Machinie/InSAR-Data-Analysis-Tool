@@ -1,0 +1,189 @@
+{
+  "project": "project",
+  "orbit": "D",
+  "pygmtsar_version": "2025.4.8.post1",
+  "processing_date_utc": "2026-05-22T07:49:08.466590Z",
+  "time_window": {
+    "start": "2018-11-01",
+    "end": "2019-02-01",
+    "days": 92
+  },
+  "scenes": {
+    "count": 8,
+    "dates": [
+      "2018-11-06",
+      "2018-11-18",
+      "2018-11-30",
+      "2018-12-12",
+      "2018-12-24",
+      "2019-01-05",
+      "2019-01-17",
+      "2019-01-29"
+    ]
+  },
+  "pairs": {
+    "initial": 25,
+    "best_used": 12
+  },
+  "aoi": {
+    "raw_wkt": "POLYGON ((-44.1281095736997 -20.115085251331006, -44.11614138829167 -20.112580724639844, -44.11084119189669 -20.1181997991009, -44.112379958592 -20.12558456140178, -44.11785112906425 -20.12892364376447, -44.12639983292713 -20.12937313017449, -44.13070837967401 -20.12157114689046, -44.1281095736997 -20.115085251331006))",
+    "buffer_deg": 0.05,
+    "tight_pad_deg": 0.005
+  },
+  "extents": {
+    "wide_bounds_lonlat": [
+      -44.18070445607243,
+      -20.17931268763593,
+      -44.060845484818095,
+      -20.062580836171033
+    ],
+    "tight_bounds_lonlat": [
+      -44.135708379674014,
+      -20.134373130174488,
+      -44.10584119189669,
+      -20.107580724639845
+    ]
+  },
+  "processing": {
+    "geocode_res_m": 15.0,
+    "sbas_days": 70,
+    "sbas_wavelength_m": 60.0,
+    "sbas_coarsen": [
+      2,
+      8
+    ]
+  },
+  "coherence_masking": {
+    "coh_threshold": 0.3,
+    "coh_mask_method": "median",
+    "enable_dynamic_coh_mask": true,
+    "dynamic_coh_mask_actually_used": true,
+    "enable_segmented_relative_output": true,
+    "segmented_actually_created": true
+  },
+  "units": {
+    "displacement": "mm  (LOS; negative = away from satellite)",
+    "velocity": "mm/year (LOS)",
+    "rmse": "mm",
+    "coherence": "unitless (0 to ~1)",
+    "segment_id": "integer (0=invalid; 1,2,3,... = continuous valid runs for the same spatial pixel)",
+    "masks": "int8 (0=invalid, 1=valid)",
+    "dem": "m (ellipsoidal heights, Copernicus GLO-30)",
+    "lat": "degrees_north (EPSG:4326)",
+    "lon": "degrees_east (EPSG:4326)"
+  },
+  "array_shapes": {
+    "sbas_displacement_raw": [
+      8,
+      102,
+      116
+    ],
+    "sbas_displacement_masked": [
+      8,
+      102,
+      116
+    ],
+    "sbas_displacement_segmented_same_pixel": [
+      8,
+      102,
+      116
+    ],
+    "sbas_velocity_raw": [
+      102,
+      116
+    ],
+    "sbas_velocity_masked": [
+      102,
+      116
+    ],
+    "sbas_rmse_raw": [
+      102,
+      116
+    ],
+    "sbas_rmse_masked": [
+      102,
+      116
+    ],
+    "sbas_valid_time_mask": [
+      8,
+      102,
+      116
+    ],
+    "sbas_segment_id": [
+      8,
+      102,
+      116
+    ],
+    "coherence_stack": [
+      12,
+      102,
+      116
+    ],
+    "coherence_mean": [
+      102,
+      116
+    ],
+    "coherence_median": [
+      102,
+      116
+    ],
+    "coherence_per_date": [
+      8,
+      102,
+      116
+    ],
+    "valid_pixel_mask": [
+      102,
+      116
+    ],
+    "dem": [
+      102,
+      116
+    ],
+    "aoi_mask": [
+      102,
+      116
+    ],
+    "lat": [
+      102
+    ],
+    "lon": [
+      116
+    ],
+    "dates": [
+      8
+    ],
+    "pair_names": [
+      12
+    ]
+  },
+  "array_dtypes": {
+    "sbas_displacement_raw": "float32",
+    "sbas_displacement_masked": "float32",
+    "sbas_displacement_segmented_same_pixel": "float32",
+    "sbas_velocity_raw": "float32",
+    "sbas_velocity_masked": "float32",
+    "sbas_rmse_raw": "float32",
+    "sbas_rmse_masked": "float32",
+    "sbas_valid_time_mask": "int8",
+    "sbas_segment_id": "int16",
+    "coherence_stack": "float32",
+    "coherence_mean": "float32",
+    "coherence_median": "float32",
+    "coherence_per_date": "float32",
+    "valid_pixel_mask": "int8",
+    "dem": "float32",
+    "aoi_mask": "bool",
+    "lat": "float64",
+    "lon": "float64",
+    "dates": "<U10",
+    "pair_names": "<U21"
+  },
+  "notes": {
+    "displacement_reference": "sbas_displacement_raw and _masked share the pygmtsar reference convention (LSQ-fit relative to reference scene).",
+    "segmented_warning": "sbas_displacement_segmented_same_pixel is a DERIVED visualization product. Each continuous valid temporal run is re-referenced to zero. Same spatial pixel preserved across runs. Use raw or masked for science.",
+    "dynamic_coherence_approximation": "coherence_per_date = mean of pair-wise coherences involving each date. True coherence is between two dates. Per-epoch quality signal, not ground truth.",
+    "mask_interpretation": "valid_pixel_mask is 2D (static). sbas_valid_time_mask is 3D (per date). For static masking the time mask = valid_pixel_mask broadcast over time.",
+    "ps_pipeline": "PS (Persistent Scatterers) processing is DISABLED. See the PS-disabled markdown cell for re-enable instructions."
+  }
+}

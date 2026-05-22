@@ -38,6 +38,13 @@ VARIABLE_LABELS = {
     "displacement_ps": "PS displacement",
 }
 
+QUALITY_VARIABLES = {
+    "displacement_sbas": "rmse_sbas",
+    "displacement_ps": "rmse_ps",
+}
+
+DEFAULT_RMSE_THRESHOLD = 0.50
+
 APP_ACCENT = "#126a65"
 APP_BG = "#f5f7f8"
 PANEL_BG = "#ffffff"
@@ -57,6 +64,8 @@ class ViewerData:
     pixel_lats: np.ndarray
     pixel_lons: np.ndarray
     series_by_variable: dict[str, np.ndarray]
+    rmse_by_variable: dict[str, np.ndarray]
+    rmse_ranges: dict[str, tuple[float, float]]
     default_selected_ids: list[int]
 
 
@@ -107,9 +116,25 @@ def load_viewer_data(dataset_path: Path) -> ViewerData:
     pixel_lons = longitudes[pixel_cols]
 
     series_by_variable: dict[str, np.ndarray] = {}
+    rmse_by_variable: dict[str, np.ndarray] = {}
+    rmse_ranges: dict[str, tuple[float, float]] = {}
     for variable in variables:
         values = dataset[variable].transpose("date", "lat", "lon").values
         series_by_variable[variable] = values[:, pixel_rows, pixel_cols].T
+
+        rmse_variable = QUALITY_VARIABLES.get(variable)
+        if rmse_variable in dataset.data_vars:
+            rmse_values = dataset[rmse_variable].transpose("lat", "lon").values[
+                pixel_rows,
+                pixel_cols,
+            ]
+            rmse_by_variable[variable] = rmse_values
+            finite_rmse = rmse_values[np.isfinite(rmse_values)]
+            if finite_rmse.size:
+                rmse_ranges[variable] = (
+                    float(np.nanmin(finite_rmse)),
+                    float(np.nanmax(finite_rmse)),
+                )
 
     default_selected_ids = [0]
     parameters = load_parameters()
@@ -131,6 +156,8 @@ def load_viewer_data(dataset_path: Path) -> ViewerData:
         pixel_lats=pixel_lats,
         pixel_lons=pixel_lons,
         series_by_variable=series_by_variable,
+        rmse_by_variable=rmse_by_variable,
+        rmse_ranges=rmse_ranges,
         default_selected_ids=default_selected_ids,
     )
 
@@ -150,23 +177,54 @@ def finite_color_range(values: np.ndarray) -> tuple[float, float]:
     return -max_abs, max_abs
 
 
-def build_map_figure(variable: str, date_index: int, selected_ids: list[int]) -> go.Figure:
-    series = VIEWER_DATA.series_by_variable[variable]
-    values = series[:, date_index]
-    color_min, color_max = finite_color_range(values)
+def quality_pixel_ids(
+    variable: str,
+    apply_quality_mask: bool,
+    rmse_threshold: float | None,
+) -> np.ndarray:
+    total_pixels = len(VIEWER_DATA.pixel_lons)
+    if not apply_quality_mask:
+        return np.arange(total_pixels)
 
-    selected_set = set(int(pixel_id) for pixel_id in selected_ids)
-    selected_ids_clean = [
-        pixel_id for pixel_id in selected_set if 0 <= pixel_id < len(VIEWER_DATA.pixel_lons)
-    ]
+    rmse_values = VIEWER_DATA.rmse_by_variable.get(variable)
+    if rmse_values is None:
+        return np.arange(total_pixels)
+
+    threshold = DEFAULT_RMSE_THRESHOLD if rmse_threshold is None else float(rmse_threshold)
+    return np.flatnonzero(np.isfinite(rmse_values) & (rmse_values <= threshold))
+
+
+def clean_selected_ids(selected_ids: list[int], allowed_ids: np.ndarray) -> list[int]:
+    allowed = set(int(pixel_id) for pixel_id in allowed_ids)
+    return sorted(
+        {
+            int(pixel_id)
+            for pixel_id in selected_ids
+            if int(pixel_id) in allowed
+        }
+    )
+
+
+def build_map_figure(
+    variable: str,
+    date_index: int,
+    selected_ids: list[int],
+    apply_quality_mask: bool,
+    rmse_threshold: float | None,
+) -> go.Figure:
+    series = VIEWER_DATA.series_by_variable[variable]
+    visible_ids = quality_pixel_ids(variable, apply_quality_mask, rmse_threshold)
+    values = series[visible_ids, date_index]
+    color_min, color_max = finite_color_range(values)
+    selected_ids_clean = clean_selected_ids(selected_ids, visible_ids)
 
     figure = go.Figure()
     figure.add_trace(
         go.Scattergl(
-            x=VIEWER_DATA.pixel_lons,
-            y=VIEWER_DATA.pixel_lats,
+            x=VIEWER_DATA.pixel_lons[visible_ids],
+            y=VIEWER_DATA.pixel_lats[visible_ids],
             mode="markers",
-            customdata=list(range(len(VIEWER_DATA.pixel_lons))),
+            customdata=visible_ids.tolist(),
             marker={
                 "size": 7,
                 "color": values,
@@ -213,7 +271,7 @@ def build_map_figure(variable: str, date_index: int, selected_ids: list[int]) ->
         plot_bgcolor=PANEL_BG,
         dragmode="lasso",
         clickmode="event+select",
-        uirevision=f"{variable}-{date_index}",
+        uirevision=f"{variable}-{date_index}-{apply_quality_mask}-{rmse_threshold}",
         title={
             "text": f"{VARIABLE_LABELS.get(variable, variable)} on {VIEWER_DATA.dates[date_index].date()}",
             "font": {"size": 15, "color": TEXT_MAIN},
@@ -254,11 +312,15 @@ def series_lines_for_pixels(series: np.ndarray, selected_ids: list[int]) -> tupl
     return x_values, y_values
 
 
-def build_timeseries_figure(variable: str, selected_ids: list[int]) -> go.Figure:
+def build_timeseries_figure(
+    variable: str,
+    selected_ids: list[int],
+    apply_quality_mask: bool,
+    rmse_threshold: float | None,
+) -> go.Figure:
     series = VIEWER_DATA.series_by_variable[variable]
-    selected_ids_clean = sorted(
-        {int(pixel_id) for pixel_id in selected_ids if 0 <= int(pixel_id) < series.shape[0]}
-    )
+    visible_ids = quality_pixel_ids(variable, apply_quality_mask, rmse_threshold)
+    selected_ids_clean = clean_selected_ids(selected_ids, visible_ids)
 
     figure = go.Figure()
 
@@ -337,16 +399,51 @@ def build_timeseries_figure(variable: str, selected_ids: list[int]) -> go.Figure
     return figure
 
 
-def build_selection_summary(variable: str, selected_ids: list[int]) -> list:
+def build_selection_summary(
+    variable: str,
+    selected_ids: list[int],
+    apply_quality_mask: bool,
+    rmse_threshold: float | None,
+) -> list:
     series = VIEWER_DATA.series_by_variable[variable]
-    selected_ids_clean = sorted(
-        {int(pixel_id) for pixel_id in selected_ids if 0 <= int(pixel_id) < series.shape[0]}
-    )
+    visible_ids = quality_pixel_ids(variable, apply_quality_mask, rmse_threshold)
+    selected_ids_clean = clean_selected_ids(selected_ids, visible_ids)
+    total_pixels = len(VIEWER_DATA.pixel_lons)
+    rmse_range = VIEWER_DATA.rmse_ranges.get(variable)
+    if apply_quality_mask and rmse_range is not None:
+        threshold = DEFAULT_RMSE_THRESHOLD if rmse_threshold is None else float(rmse_threshold)
+        quality_text = f"{len(visible_ids):,} / {total_pixels:,}"
+        threshold_text = f"RMSE <= {threshold:.2f} mm"
+    elif rmse_range is not None:
+        quality_text = f"{total_pixels:,} / {total_pixels:,}"
+        threshold_text = "RMSE mask off"
+    else:
+        quality_text = f"{total_pixels:,} / {total_pixels:,}"
+        threshold_text = "No RMSE layer"
 
     if not selected_ids_clean:
         return [
-            html.Div("Selected pixels", className="summary-label"),
-            html.Div("0", className="summary-value"),
+            html.Div(
+                [
+                    html.Div("Selected pixels", className="summary-label"),
+                    html.Div("0", className="summary-value"),
+                ],
+                className="summary-item",
+            ),
+            html.Div(
+                [
+                    html.Div("Quality pixels", className="summary-label"),
+                    html.Div(quality_text, className="summary-value"),
+                ],
+                className="summary-item",
+            ),
+            html.Div(
+                [
+                    html.Div("Quality rule", className="summary-label"),
+                    html.Div(threshold_text, className="summary-value"),
+                ],
+                className="summary-item",
+            ),
         ]
 
     selected_series = series[selected_ids_clean, :]
@@ -374,6 +471,13 @@ def build_selection_summary(variable: str, selected_ids: list[int]) -> list:
             [
                 html.Div("Mean range", className="summary-label"),
                 html.Div(f"{min_mean:.2f} to {max_mean:.2f} mm", className="summary-value"),
+            ],
+            className="summary-item",
+        ),
+        html.Div(
+            [
+                html.Div("Quality pixels", className="summary-label"),
+                html.Div(quality_text, className="summary-value"),
             ],
             className="summary-item",
         ),
@@ -448,6 +552,37 @@ def make_app() -> Dash:
                                     ),
                                 ],
                                 className="date-control",
+                            ),
+                            html.Div(
+                                [
+                                    html.Label("Quality mask"),
+                                    dcc.Checklist(
+                                        id="quality-mask-toggle",
+                                        options=[
+                                            {
+                                                "label": "Use RMSE mask",
+                                                "value": "rmse",
+                                            }
+                                        ],
+                                        value=["rmse"],
+                                        className="quality-checklist",
+                                    ),
+                                ],
+                                className="quality-control",
+                            ),
+                            html.Div(
+                                [
+                                    html.Label("Max RMSE"),
+                                    dcc.Input(
+                                        id="rmse-threshold",
+                                        type="number",
+                                        value=DEFAULT_RMSE_THRESHOLD,
+                                        min=0,
+                                        step=0.01,
+                                        className="number-input",
+                                    ),
+                                ],
+                                className="rmse-control",
                             ),
                             html.Button("Clear selection", id="clear-selection", n_clicks=0),
                         ],
@@ -532,12 +667,14 @@ def make_app() -> Dash:
             }
             .controls {
                 display: grid;
-                grid-template-columns: minmax(190px, 240px) minmax(170px, 210px) auto;
+                grid-template-columns: minmax(185px, 220px) minmax(150px, 180px) minmax(150px, 170px) minmax(110px, 130px) minmax(140px, 170px);
                 gap: 16px;
                 align-items: end;
             }
             .control-group label,
-            .date-control label {
+            .date-control label,
+            .quality-control label,
+            .rmse-control label {
                 display: block;
                 margin-bottom: 7px;
                 color: #435058;
@@ -547,7 +684,30 @@ def make_app() -> Dash:
             }
             .date-control {
                 min-width: 0;
+            }
+            .quality-control,
+            .rmse-control {
                 min-width: 0;
+            }
+            .quality-checklist label {
+                margin: 0;
+                color: #172126;
+                font-size: 13px;
+                font-weight: 600;
+                text-transform: none;
+                white-space: nowrap;
+            }
+            .quality-checklist input {
+                margin-right: 7px;
+            }
+            .number-input {
+                width: 100%;
+                height: 38px;
+                padding: 0 10px;
+                border: 1px solid #b8c6cb;
+                border-radius: 6px;
+                color: #172126;
+                font: inherit;
             }
             #clear-selection {
                 height: 38px;
@@ -668,14 +828,33 @@ def make_app() -> Dash:
         Output("selection-summary", "children"),
         Input("variable-dropdown", "value"),
         Input("date-dropdown", "value"),
+        Input("quality-mask-toggle", "value"),
+        Input("rmse-threshold", "value"),
         Input("selection-store", "data"),
     )
-    def update_figures(variable, date_index, selected_ids):
+    def update_figures(variable, date_index, quality_mask_values, rmse_threshold, selected_ids):
         selected_ids = selected_ids or []
         date_index = int(date_index)
-        map_figure = build_map_figure(variable, date_index, selected_ids)
-        timeseries_figure = build_timeseries_figure(variable, selected_ids)
-        selection_summary = build_selection_summary(variable, selected_ids)
+        apply_quality_mask = "rmse" in (quality_mask_values or [])
+        map_figure = build_map_figure(
+            variable,
+            date_index,
+            selected_ids,
+            apply_quality_mask,
+            rmse_threshold,
+        )
+        timeseries_figure = build_timeseries_figure(
+            variable,
+            selected_ids,
+            apply_quality_mask,
+            rmse_threshold,
+        )
+        selection_summary = build_selection_summary(
+            variable,
+            selected_ids,
+            apply_quality_mask,
+            rmse_threshold,
+        )
         return map_figure, timeseries_figure, selection_summary
 
     return app

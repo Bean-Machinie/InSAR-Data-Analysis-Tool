@@ -1,0 +1,194 @@
+{
+  "project": "project",
+  "orbit": "D",
+  "created": "2026-05-22T07:49:08.752517Z",
+  "crs": "EPSG:4326",
+  "ps_pipeline": "disabled",
+  "files": {
+    "netcdf": {
+      "outputs/project_D/results_wide.nc": 26252414,
+      "outputs/project_D/results_tight.nc": 1612331
+    },
+    "geotiffs": {
+      "outputs/project_D/geotiffs/sbas_velocity_raw.tif": 43641,
+      "outputs/project_D/geotiffs/sbas_velocity_masked.tif": 12399,
+      "outputs/project_D/geotiffs/sbas_rmse_raw.tif": 41263,
+      "outputs/project_D/geotiffs/sbas_rmse_masked.tif": 12040,
+      "outputs/project_D/geotiffs/coherence_mean.tif": 40419,
+      "outputs/project_D/geotiffs/coherence_median.tif": 40510,
+      "outputs/project_D/geotiffs/dem.tif": 40777,
+      "outputs/project_D/geotiffs/disp_raw_2018-11-06.tif": 1590,
+      "outputs/project_D/geotiffs/disp_raw_2018-11-18.tif": 43896,
+      "outputs/project_D/geotiffs/disp_raw_2018-11-30.tif": 43873,
+      "outputs/project_D/geotiffs/disp_raw_2018-12-12.tif": 43748,
+      "outputs/project_D/geotiffs/disp_raw_2018-12-24.tif": 43752,
+      "outputs/project_D/geotiffs/disp_raw_2019-01-05.tif": 43786,
+      "outputs/project_D/geotiffs/disp_raw_2019-01-17.tif": 43726,
+      "outputs/project_D/geotiffs/disp_raw_2019-01-29.tif": 43692,
+      "outputs/project_D/geotiffs/disp_masked_2018-11-06.tif": 4031,
+      "outputs/project_D/geotiffs/disp_masked_2018-11-18.tif": 16189,
+      "outputs/project_D/geotiffs/disp_masked_2018-11-30.tif": 16833,
+      "outputs/project_D/geotiffs/disp_masked_2018-12-12.tif": 14663,
+      "outputs/project_D/geotiffs/disp_masked_2018-12-24.tif": 17479,
+      "outputs/project_D/geotiffs/disp_masked_2019-01-05.tif": 14966,
+      "outputs/project_D/geotiffs/disp_masked_2019-01-17.tif": 15781,
+      "outputs/project_D/geotiffs/disp_masked_2019-01-29.tif": 14758,
+      "outputs/project_D/geotiffs/disp_segmented_2018-11-06.tif": 4221,
+      "outputs/project_D/geotiffs/disp_segmented_2018-11-18.tif": 13556,
+      "outputs/project_D/geotiffs/disp_segmented_2018-11-30.tif": 13526,
+      "outputs/project_D/geotiffs/disp_segmented_2018-12-12.tif": 12244,
+      "outputs/project_D/geotiffs/disp_segmented_2018-12-24.tif": 13061,
+      "outputs/project_D/geotiffs/disp_segmented_2019-01-05.tif": 12815,
+      "outputs/project_D/geotiffs/disp_segmented_2019-01-17.tif": 12592,
+      "outputs/project_D/geotiffs/disp_segmented_2019-01-29.tif": 11676
+    },
+    "npz": "outputs/project_D/sbas_results_masked.npz",
+    "metadata": "outputs/project_D/sbas_results_metadata.json",
+    "parameters": "outputs/project_D/parameters.json"
+  },
+  "extents": {
+    "wide_bounds_lonlat": [
+      -44.18070445607243,
+      -20.17931268763593,
+      -44.060845484818095,
+      -20.062580836171033
+    ],
+    "tight_bounds_lonlat": [
+      -44.135708379674014,
+      -20.134373130174488,
+      -44.10584119189669,
+      -20.107580724639845
+    ]
+  },
+  "variables": {
+    "sbas_displacement_raw": {
+      "units": "mm",
+      "description": "Raw cumulative LOS displacement from SBAS, per date. Same reference convention as pygmtsar output.",
+      "shape": {
+        "date": 8,
+        "lat": 444,
+        "lon": 464
+      }
+    },
+    "sbas_displacement_masked": {
+      "units": "mm",
+      "description": "sbas_displacement_raw with low-coherence samples set to NaN. Same reference convention.",
+      "shape": {
+        "date": 8,
+        "lat": 444,
+        "lon": 464
+      }
+    },
+    "sbas_displacement_segmented_same_pixel": {
+      "units": "mm",
+      "description": "DERIVED visualization product: each continuous valid temporal run at the same spatial pixel is re-referenced to zero at its first valid sample. NOT the scientific SBAS output.",
+      "shape": {
+        "date": 8,
+        "lat": 444,
+        "lon": 464
+      }
+    },
+    "sbas_velocity_raw": {
+      "units": "mm/year",
+      "description": "LOS velocity from SBAS (linear fit through cumulative displacement).",
+      "shape": {
+        "lat": 444,
+        "lon": 464
+      }
+    },
+    "sbas_velocity_masked": {
+      "units": "mm/year",
+      "description": "sbas_velocity_raw with low-coherence pixels (static mask) set to NaN.",
+      "shape": {
+        "lat": 444,
+        "lon": 464
+      }
+    },
+    "sbas_rmse_raw": {
+      "units": "mm",
+      "description": "SBAS LSQ residual RMSE per pixel.",
+      "shape": {
+        "lat": 444,
+        "lon": 464
+      }
+    },
+    "sbas_rmse_masked": {
+      "units": "mm",
+      "description": "sbas_rmse_raw with low-coherence pixels (static mask) set to NaN.",
+      "shape": {
+        "lat": 444,
+        "lon": 464
+      }
+    },
+    "sbas_valid_time_mask": {
+      "units": "1",
+      "description": "Per-sample mask (1=valid, 0=invalid). Dynamic if available, else static valid_pixel_mask broadcast over time.",
+      "shape": {
+        "date": 8,
+        "lat": 444,
+        "lon": 464
+      }
+    },
+    "sbas_segment_id": {
+      "units": "1",
+      "description": "Integer segment id (0=invalid, 1,2,3,... = continuous valid temporal runs for the same spatial pixel).",
+      "shape": {
+        "date": 8,
+        "lat": 444,
+        "lon": 464
+      }
+    },
+    "coherence_mean": {
+      "units": "1",
+      "description": "Mean of multilook coherence across all SBAS pairs.",
+      "shape": {
+        "lat": 444,
+        "lon": 464
+      }
+    },
+    "coherence_median": {
+      "units": "1",
+      "description": "Median of multilook coherence across all SBAS pairs (robust to outlier pairs).",
+      "shape": {
+        "lat": 444,
+        "lon": 464
+      }
+    },
+    "valid_pixel_mask": {
+      "units": "1",
+      "description": "Static mask (1=valid, 0=invalid): coherence_median >= 0.3.",
+      "shape": {
+        "lat": 444,
+        "lon": 464
+      }
+    },
+    "coherence_per_date": {
+      "units": "1",
+      "description": "Mean coherence of pairs that include each acquisition date. Per-date proxy (true coherence is between two dates).",
+      "shape": {
+        "date": 8,
+        "lat": 444,
+        "lon": 464
+      }
+    },
+    "coherence_stack": {
+      "units": "1",
+      "description": "Per-pair multilook coherence stack (shape: pair, lat, lon).",
+      "shape": {
+        "pair": 12,
+        "lat": 444,
+        "lon": 464
+      }
+    },
+    "dem": {
+      "units": "m",
+      "description": "Copernicus GLO-30 DEM, ellipsoidal, interpolated to product grid.",
+      "shape": {
+        "lat": 444,
+        "lon": 464
+      }
+    }
+  },
+  "loader_example_netcdf": "import xarray as xr\nds = xr.open_dataset('outputs/project_D/results_tight.nc')\nvel    = ds.sbas_velocity_raw            # mm/year\nvel_m  = ds.sbas_velocity_masked         # mm/year, low-coh pixels = NaN\nraw_ts = ds.sbas_displacement_raw.sel(lat=-20.12, lon=-44.12, method='nearest')\nmsk_ts = ds.sbas_displacement_masked.sel(lat=-20.12, lon=-44.12, method='nearest')\nseg_ts = ds.sbas_displacement_segmented_same_pixel.sel(lat=-20.12, lon=-44.12, method='nearest')\n",
+  "loader_example_npz": "import numpy as np, json\nnpz  = np.load('outputs/project_D/sbas_results_masked.npz', allow_pickle=True)\nmeta = json.loads(str(npz['metadata_json']))\nvel  = npz['sbas_velocity_raw']                       # (lat, lon)\ndisp = npz['sbas_displacement_raw']                   # (date, lat, lon)\nmask = npz['sbas_valid_time_mask'].astype(bool)       # (date, lat, lon)\nseg  = npz['sbas_displacement_segmented_same_pixel']  # (date, lat, lon)\nsid  = npz['sbas_segment_id']                         # (date, lat, lon)\nlat, lon, dates = npz['lat'], npz['lon'], npz['dates']\n"
+}
