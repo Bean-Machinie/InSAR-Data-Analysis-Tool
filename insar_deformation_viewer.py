@@ -1109,6 +1109,7 @@ APP_HTML = r"""<!DOCTYPE html>
       L.control.scale().addTo(state.map);
       state.map.fitBounds(payload.bounds, { padding: [20, 20] });
       document.getElementById("map").addEventListener("click", onMapContainerClick);
+      document.addEventListener("click", onDocumentMapClick, true);
     }
 
     function initLayerState(payload) {
@@ -1445,6 +1446,18 @@ APP_HTML = r"""<!DOCTYPE html>
 
     function onMapContainerClick(event) {
       if (event.target.closest(".leaflet-control, .floating-control, .settings-panel, .time-panel")) return;
+      event.stopPropagation();
+      routeMapClick(event);
+    }
+
+    function onDocumentMapClick(event) {
+      if (event.target.closest(".leaflet-control, .floating-control, .settings-panel, .time-panel")) return;
+      if (!document.getElementById("map").contains(event.target)) return;
+      routeMapClick(event);
+    }
+
+    function routeMapClick(event) {
+      document.body.dataset.lastMapClick = `${event.clientX},${event.clientY}`;
       const rect = document.getElementById("map").getBoundingClientRect();
       const point = L.point(event.clientX - rect.left, event.clientY - rect.top);
       handleMapLatLng(state.map.containerPointToLatLng(point));
