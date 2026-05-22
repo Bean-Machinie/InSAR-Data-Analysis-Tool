@@ -2,10 +2,14 @@
 Interactive AOI deformation viewer.
 
 Run:
-    python insar_deformation_viewer.py
+    python insar_deformation_viewer.py Data\\project_D_results_only
 
 Then open:
     http://127.0.0.1:8050
+
+The project folder can be either the outer export bundle or the inner
+outputs/<project>_<orbit> product folder. If an AOI-clipped NetCDF exists it is
+used first; otherwise the viewer falls back to results_tight.nc.
 
 Dependency notes:
     pip install dash plotly xarray netcdf4 rioxarray pandas matplotlib numpy
@@ -13,6 +17,7 @@ Dependency notes:
 
 from __future__ import annotations
 
+import argparse
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,25 +28,15 @@ import plotly.graph_objects as go
 import xarray as xr
 from dash import Dash, Input, Output, State, ctx, dcc, html
 
-
-PROJECT_DIR = Path(r"E:\Scripts\InSAR-Data-Analysis-Tool\Data\project_dam_D")
-AOI_DATASET_PATH = PROJECT_DIR / "aoi_only" / "results_aoi_masked.nc"
-PARAMETERS_PATH = PROJECT_DIR / "parameters.json"
-
-DISPLACEMENT_VARIABLES = (
-    "displacement_sbas",
-    "displacement_ps",
+from insar_project import (
+    DISPLACEMENT_VARIABLES,
+    QUALITY_VARIABLES,
+    VARIABLE_LABELS,
+    ProjectPaths,
+    add_project_dir_argument,
+    find_netcdf_files,
+    resolve_project_paths,
 )
-
-VARIABLE_LABELS = {
-    "displacement_sbas": "SBAS displacement",
-    "displacement_ps": "PS displacement",
-}
-
-QUALITY_VARIABLES = {
-    "displacement_sbas": "rmse_sbas",
-    "displacement_ps": "rmse_ps",
-}
 
 DEFAULT_RMSE_THRESHOLD = 0.50
 
@@ -55,6 +50,7 @@ TEXT_MUTED = "#5d6970"
 @dataclass(frozen=True)
 class ViewerData:
     dataset_path: Path
+    parameters_path: Path
     variables: tuple[str, ...]
     dates: pd.DatetimeIndex
     latitudes: np.ndarray
@@ -69,23 +65,36 @@ class ViewerData:
     default_selected_ids: list[int]
 
 
-def load_parameters() -> dict:
-    if not PARAMETERS_PATH.exists():
+VIEWER_DATA: ViewerData | None = None
+
+
+def load_parameters(parameters_path: Path) -> dict:
+    if not parameters_path.exists():
         return {}
-    with PARAMETERS_PATH.open("r", encoding="utf-8") as file:
+    with parameters_path.open("r", encoding="utf-8") as file:
         return json.load(file)
 
 
-def nearest_pixel_id(pixel_lons: np.ndarray, pixel_lats: np.ndarray, lon: float, lat: float) -> int:
-    distances = (pixel_lons - lon) ** 2 + (pixel_lats - lat) ** 2
-    return int(np.nanargmin(distances))
+def nearest_pixel_id(
+    pixel_lons: np.ndarray,
+    pixel_lats: np.ndarray,
+    lon: float,
+    lat: float,
+    candidate_ids: np.ndarray | None = None,
+) -> int:
+    if candidate_ids is None or len(candidate_ids) == 0:
+        distances = (pixel_lons - lon) ** 2 + (pixel_lats - lat) ** 2
+        return int(np.nanargmin(distances))
+
+    distances = (pixel_lons[candidate_ids] - lon) ** 2 + (pixel_lats[candidate_ids] - lat) ** 2
+    return int(candidate_ids[int(np.nanargmin(distances))])
 
 
-def load_viewer_data(dataset_path: Path) -> ViewerData:
+def load_viewer_data(dataset_path: Path, parameters_path: Path) -> ViewerData:
     if not dataset_path.exists():
         raise FileNotFoundError(
             f"AOI dataset was not found: {dataset_path}. "
-            "Run clip_insar_to_aoi.py first."
+            "Run clip_insar_to_aoi.py first or pass a project folder with results_tight.nc."
         )
 
     with xr.open_dataset(dataset_path) as dataset:
@@ -136,17 +145,45 @@ def load_viewer_data(dataset_path: Path) -> ViewerData:
                     float(np.nanmax(finite_rmse)),
                 )
 
-    default_selected_ids = [0]
-    parameters = load_parameters()
+    default_variable = variables[0]
+    default_series = series_by_variable[default_variable]
+    finite_series_candidates = np.flatnonzero(np.isfinite(default_series).any(axis=1))
+    default_rmse = rmse_by_variable.get(default_variable)
+    if default_rmse is not None:
+        rmse_candidates = np.flatnonzero(
+            np.isfinite(default_rmse) & (default_rmse <= DEFAULT_RMSE_THRESHOLD)
+        )
+        default_candidates = np.intersect1d(rmse_candidates, finite_series_candidates)
+    else:
+        default_candidates = finite_series_candidates
+
+    if len(default_candidates) == 0:
+        default_candidates = (
+            finite_series_candidates
+            if len(finite_series_candidates)
+            else np.arange(len(pixel_lons))
+        )
+
+    default_selected_ids = [int(default_candidates[0])] if len(default_candidates) else []
+    parameters = load_parameters(parameters_path)
     pois = parameters.get("pois") or []
     if pois:
         lon = pois[0].get("lon")
         lat = pois[0].get("lat")
         if lon is not None and lat is not None:
-            default_selected_ids = [nearest_pixel_id(pixel_lons, pixel_lats, float(lon), float(lat))]
+            default_selected_ids = [
+                nearest_pixel_id(
+                    pixel_lons,
+                    pixel_lats,
+                    float(lon),
+                    float(lat),
+                    default_candidates,
+                )
+            ]
 
     return ViewerData(
         dataset_path=dataset_path,
+        parameters_path=parameters_path,
         variables=variables,
         dates=dates,
         latitudes=latitudes,
@@ -162,7 +199,23 @@ def load_viewer_data(dataset_path: Path) -> ViewerData:
     )
 
 
-VIEWER_DATA = load_viewer_data(AOI_DATASET_PATH)
+def default_dataset_path(project_paths: ProjectPaths) -> Path:
+    candidates = (
+        project_paths.aoi_output_dir / "results_aoi_masked.nc",
+        project_paths.product_dir / "results_tight.nc",
+        project_paths.product_dir / "results_wide.nc",
+    )
+    for path in candidates:
+        if path.exists():
+            return path
+
+    nc_files = find_netcdf_files(project_paths)
+    if nc_files:
+        return nc_files[0]
+
+    raise FileNotFoundError(
+        f"No NetCDF dataset found under product folder: {project_paths.product_dir}"
+    )
 
 
 def finite_color_range(values: np.ndarray) -> tuple[float, float]:
@@ -175,6 +228,16 @@ def finite_color_range(values: np.ndarray) -> tuple[float, float]:
         max_abs = 1.0
 
     return -max_abs, max_abs
+
+
+def finite_mean_by_column(values: np.ndarray) -> np.ndarray:
+    finite = np.isfinite(values)
+    counts = finite.sum(axis=0)
+    sums = np.where(finite, values, 0.0).sum(axis=0)
+    means = np.full(values.shape[1], np.nan, dtype="float64")
+    valid_columns = counts > 0
+    means[valid_columns] = sums[valid_columns] / counts[valid_columns]
+    return means
 
 
 def quality_pixel_ids(
@@ -215,6 +278,9 @@ def build_map_figure(
     series = VIEWER_DATA.series_by_variable[variable]
     visible_ids = quality_pixel_ids(variable, apply_quality_mask, rmse_threshold)
     values = series[visible_ids, date_index]
+    finite_values = np.isfinite(values)
+    visible_ids = visible_ids[finite_values]
+    values = values[finite_values]
     color_min, color_max = finite_color_range(values)
     selected_ids_clean = clean_selected_ids(selected_ids, visible_ids)
 
@@ -341,29 +407,45 @@ def build_timeseries_figure(
     else:
         x_lines, y_lines = series_lines_for_pixels(series, selected_ids_clean)
         selected_series = series[selected_ids_clean, :]
-        mean_series = np.nanmean(selected_series, axis=0)
+        if not np.isfinite(selected_series).any():
+            figure.update_layout(
+                annotations=[
+                    {
+                        "text": "Selected pixels have no finite samples",
+                        "xref": "paper",
+                        "yref": "paper",
+                        "x": 0.5,
+                        "y": 0.5,
+                        "showarrow": False,
+                        "font": {"size": 15, "color": TEXT_MUTED},
+                    }
+                ]
+            )
+            selected_ids_clean = []
+        else:
+            mean_series = finite_mean_by_column(selected_series)
 
-        figure.add_trace(
-            go.Scattergl(
-                x=x_lines,
-                y=y_lines,
-                mode="lines",
-                line={"color": "rgba(80, 88, 94, 0.22)", "width": 1},
-                hoverinfo="skip",
-                name="Selected pixels",
+            figure.add_trace(
+                go.Scattergl(
+                    x=x_lines,
+                    y=y_lines,
+                    mode="lines",
+                    line={"color": "rgba(80, 88, 94, 0.22)", "width": 1},
+                    hoverinfo="skip",
+                    name="Selected pixels",
+                )
             )
-        )
-        figure.add_trace(
-            go.Scatter(
-                x=VIEWER_DATA.dates,
-                y=mean_series,
-                mode="lines+markers",
-                line={"color": APP_ACCENT, "width": 4},
-                marker={"size": 7, "color": APP_ACCENT},
-                hovertemplate="date=%{x|%Y-%m-%d}<br>mean=%{y:.2f} mm<extra></extra>",
-                name="Mean",
+            figure.add_trace(
+                go.Scatter(
+                    x=VIEWER_DATA.dates,
+                    y=mean_series,
+                    mode="lines+markers",
+                    line={"color": APP_ACCENT, "width": 4},
+                    marker={"size": 7, "color": APP_ACCENT},
+                    hovertemplate="date=%{x|%Y-%m-%d}<br>mean=%{y:.2f} mm<extra></extra>",
+                    name="Mean",
+                )
             )
-        )
 
     figure.update_layout(
         margin={"l": 58, "r": 22, "t": 34, "b": 48},
@@ -447,10 +529,43 @@ def build_selection_summary(
         ]
 
     selected_series = series[selected_ids_clean, :]
-    mean_series = np.nanmean(selected_series, axis=0)
-    final_mean = float(mean_series[-1])
-    min_mean = float(np.nanmin(mean_series))
-    max_mean = float(np.nanmax(mean_series))
+    if not np.isfinite(selected_series).any():
+        return [
+            html.Div(
+                [
+                    html.Div("Selected pixels", className="summary-label"),
+                    html.Div(f"{len(selected_ids_clean):,}", className="summary-value"),
+                ],
+                className="summary-item",
+            ),
+            html.Div(
+                [
+                    html.Div("Finite samples", className="summary-label"),
+                    html.Div("0", className="summary-value"),
+                ],
+                className="summary-item",
+            ),
+            html.Div(
+                [
+                    html.Div("Quality pixels", className="summary-label"),
+                    html.Div(quality_text, className="summary-value"),
+                ],
+                className="summary-item",
+            ),
+            html.Div(
+                [
+                    html.Div("Quality rule", className="summary-label"),
+                    html.Div(threshold_text, className="summary-value"),
+                ],
+                className="summary-item",
+            ),
+        ]
+
+    mean_series = finite_mean_by_column(selected_series)
+    finite_mean = mean_series[np.isfinite(mean_series)]
+    latest_mean = float(finite_mean[-1])
+    min_mean = float(finite_mean.min())
+    max_mean = float(finite_mean.max())
 
     return [
         html.Div(
@@ -462,8 +577,8 @@ def build_selection_summary(
         ),
         html.Div(
             [
-                html.Div("Final mean", className="summary-label"),
-                html.Div(f"{final_mean:.2f} mm", className="summary-value"),
+                html.Div("Latest mean", className="summary-label"),
+                html.Div(f"{latest_mean:.2f} mm", className="summary-value"),
             ],
             className="summary-item",
         ),
@@ -500,6 +615,9 @@ def extract_ids_from_points(points: list[dict]) -> list[int]:
 
 
 def make_app() -> Dash:
+    if VIEWER_DATA is None:
+        raise RuntimeError("Viewer data has not been loaded.")
+
     app = Dash(__name__)
     app.title = "InSAR AOI Deformation Viewer"
 
@@ -860,6 +978,37 @@ def make_app() -> Dash:
     return app
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    add_project_dir_argument(parser)
+    parser.add_argument(
+        "--dataset",
+        type=Path,
+        help=(
+            "NetCDF dataset to view. Defaults to aoi_only/results_aoi_masked.nc "
+            "when present, otherwise results_tight.nc."
+        ),
+    )
+    parser.add_argument("--host", default="127.0.0.1", help="Dash host.")
+    parser.add_argument("--port", type=int, default=8050, help="Dash port.")
+    parser.add_argument("--debug", action="store_true", help="Run Dash in debug mode.")
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = parse_args()
+    project_paths = resolve_project_paths(args.project_dir)
+    dataset_path = (
+        args.dataset.expanduser().resolve()
+        if args.dataset is not None
+        else default_dataset_path(project_paths)
+    )
+    VIEWER_DATA = load_viewer_data(dataset_path, project_paths.parameters_path)
+
+    print(f"Project folder: {project_paths.root_dir}")
+    print(f"Product folder: {project_paths.product_dir}")
+    print(f"Dataset: {dataset_path}")
+    print(f"Open: http://{args.host}:{args.port}")
+
     dash_app = make_app()
-    dash_app.run(host="127.0.0.1", port=8050, debug=False)
+    dash_app.run(host=args.host, port=args.port, debug=args.debug)

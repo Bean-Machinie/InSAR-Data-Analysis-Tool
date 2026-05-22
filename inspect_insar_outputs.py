@@ -1,30 +1,30 @@
 """
 Simple inspection script for exported InSAR results.
 
+Run:
+    python inspect_insar_outputs.py Data\\project_D_results_only
+
+The folder can be either the outer export bundle or the inner
+outputs/<project>_<orbit> product folder.
+
 Dependency notes:
     pip install xarray netcdf4 rioxarray rasterio pandas matplotlib numpy
 """
 
+from __future__ import annotations
+
+import argparse
 from pathlib import Path
 
-
-PROJECT_DIR = Path(r"E:\Scripts\InSAR-Data-Analysis-Tool\Data\project_dam_D")
-GEOTIFF_DIR = PROJECT_DIR / "geotiffs"
-TIMESERIES_DIR = PROJECT_DIR / "timeseries"
-OUTPUT_DIR = Path(__file__).resolve().parent
-
-IMPORTANT_NETCDF_VARIABLES = (
-    "velocity_sbas",
-    "velocity_ps",
-    "displacement_sbas",
-    "displacement_ps",
-    "rmse_sbas",
-    "rmse_ps",
-)
-
-PREFERRED_NETCDF_NAMES = (
-    "results_tight.nc",
-    "results_AOI_clipped.nc",
+from insar_project import (
+    IMPORTANT_NETCDF_VARIABLES,
+    VELOCITY_VARIABLE_CANDIDATES,
+    ProjectPaths,
+    add_project_dir_argument,
+    display_label,
+    first_existing_variable,
+    prioritize_netcdf_files,
+    resolve_project_paths,
 )
 
 
@@ -76,23 +76,6 @@ def list_files(folder: Path, label: str) -> list[Path]:
         print("No files found.")
 
     return files
-
-
-def prioritize_netcdf_files(files: list[Path]) -> list[Path]:
-    nc_files = [path for path in files if path.suffix.lower() == ".nc"]
-    by_name = {path.name.lower(): path for path in nc_files}
-
-    ordered: list[Path] = []
-    for name in PREFERRED_NETCDF_NAMES:
-        path = by_name.get(name.lower())
-        if path is not None:
-            ordered.append(path)
-
-    ordered_names = {path.name.lower() for path in ordered}
-    ordered.extend(
-        sorted(path for path in nc_files if path.name.lower() not in ordered_names)
-    )
-    return ordered
 
 
 def print_xarray_crs(dataset) -> None:
@@ -208,7 +191,7 @@ def inspect_netcdf(path: Path) -> bool:
             if not any_important:
                 print("  None of the expected important variables were found.")
 
-            return "velocity_sbas" in dataset.data_vars
+            return first_existing_variable(dataset, VELOCITY_VARIABLE_CANDIDATES) is not None
     except Exception as exc:
         print(f"Could not inspect NetCDF file {path}: {exc}")
         return False
@@ -220,13 +203,13 @@ def inspect_netcdf_files(netcdf_files: list[Path]) -> Path | None:
         print("No NetCDF files found in the project root.")
         return None
 
-    velocity_sbas_path = None
+    velocity_netcdf_path = None
     for path in netcdf_files:
-        has_velocity_sbas = inspect_netcdf(path)
-        if has_velocity_sbas and velocity_sbas_path is None:
-            velocity_sbas_path = path
+        has_velocity = inspect_netcdf(path)
+        if has_velocity and velocity_netcdf_path is None:
+            velocity_netcdf_path = path
 
-    return velocity_sbas_path
+    return velocity_netcdf_path
 
 
 def raster_min_max(data, nodata):
@@ -339,9 +322,7 @@ def reduce_data_array_for_plot(data_array):
     return plot_data
 
 
-def plot_velocity_sbas(netcdf_path: Path) -> bool:
-    output_path = OUTPUT_DIR / "quicklook_velocity_sbas.png"
-
+def plot_velocity_variable(netcdf_path: Path, output_dir: Path) -> bool:
     try:
         import matplotlib.pyplot as plt
         import xarray as xr
@@ -351,31 +332,32 @@ def plot_velocity_sbas(netcdf_path: Path) -> bool:
 
     try:
         with xr.open_dataset(netcdf_path) as dataset:
-            if "velocity_sbas" not in dataset:
+            variable = first_existing_variable(dataset, VELOCITY_VARIABLE_CANDIDATES)
+            if variable is None:
                 return False
 
-            plot_data = reduce_data_array_for_plot(dataset["velocity_sbas"])
+            plot_data = reduce_data_array_for_plot(dataset[variable])
+            output_path = output_dir / f"quicklook_{variable}.png"
 
             plt.figure(figsize=(8, 6))
             if plot_data.ndim == 2:
-                plot_data.plot(cmap="viridis")
+                plot_data.plot(cmap="RdBu_r")
             else:
                 plot_data.plot()
-            plt.title(f"velocity_sbas from {netcdf_path.name}")
+            plt.title(f"{display_label(variable)} from {netcdf_path.name}")
             plt.tight_layout()
+            output_dir.mkdir(parents=True, exist_ok=True)
             plt.savefig(output_path, dpi=150)
             plt.close()
 
         print(f"Saved quicklook plot: {output_path}")
         return True
     except Exception as exc:
-        print(f"Could not create velocity_sbas quicklook: {exc}")
+        print(f"Could not create velocity quicklook: {exc}")
         return False
 
 
-def plot_first_geotiff(geotiff_path: Path) -> bool:
-    output_path = OUTPUT_DIR / "quicklook_first_geotiff.png"
-
+def plot_first_geotiff(geotiff_path: Path, output_dir: Path) -> bool:
     try:
         import matplotlib.pyplot as plt
         import numpy as np
@@ -390,11 +372,13 @@ def plot_first_geotiff(geotiff_path: Path) -> bool:
             if src.nodata is not None:
                 data = np.where(data == src.nodata, np.nan, data)
 
+        output_path = output_dir / "quicklook_first_geotiff.png"
         plt.figure(figsize=(8, 6))
         plt.imshow(data, cmap="viridis")
         plt.colorbar(label=geotiff_path.name)
         plt.title(geotiff_path.name)
         plt.tight_layout()
+        output_dir.mkdir(parents=True, exist_ok=True)
         plt.savefig(output_path, dpi=150)
         plt.close()
 
@@ -405,9 +389,7 @@ def plot_first_geotiff(geotiff_path: Path) -> bool:
         return False
 
 
-def plot_first_timeseries(csv_path: Path) -> bool:
-    output_path = OUTPUT_DIR / "quicklook_timeseries.png"
-
+def plot_first_timeseries(csv_path: Path, output_dir: Path) -> bool:
     try:
         import matplotlib.pyplot as plt
         import pandas as pd
@@ -435,12 +417,14 @@ def plot_first_timeseries(csv_path: Path) -> bool:
                 x_label = column
                 break
 
+        output_path = output_dir / "quicklook_timeseries.png"
         plt.figure(figsize=(8, 4))
         plt.plot(x_values, data[y_column], marker="o")
         plt.xlabel(x_label)
         plt.ylabel(y_column)
         plt.title(f"{y_column} from {csv_path.name}")
         plt.tight_layout()
+        output_dir.mkdir(parents=True, exist_ok=True)
         plt.savefig(output_path, dpi=150)
         plt.close()
 
@@ -452,46 +436,73 @@ def plot_first_timeseries(csv_path: Path) -> bool:
 
 
 def create_quicklook(
-    velocity_sbas_netcdf: Path | None,
+    velocity_netcdf: Path | None,
     geotiff_files: list[Path],
     csv_path: Path | None,
+    output_dir: Path,
 ) -> None:
     print_section("Quicklook plot")
 
-    if velocity_sbas_netcdf is not None and plot_velocity_sbas(velocity_sbas_netcdf):
+    if velocity_netcdf is not None and plot_velocity_variable(velocity_netcdf, output_dir):
         return
 
-    if geotiff_files and plot_first_geotiff(geotiff_files[0]):
+    if geotiff_files and plot_first_geotiff(geotiff_files[0], output_dir):
         return
 
-    if csv_path is not None and plot_first_timeseries(csv_path):
+    if csv_path is not None and plot_first_timeseries(csv_path, output_dir):
         return
 
     print("No quicklook plot could be created from the available data.")
 
 
-def main() -> None:
-    print_section("InSAR output inspection")
-    print(f"Project folder: {PROJECT_DIR}")
-    print(f"Quicklook output folder: {OUTPUT_DIR}")
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    add_project_dir_argument(parser)
+    parser.add_argument(
+        "--quicklook-dir",
+        type=Path,
+        default=Path(__file__).resolve().parent,
+        help="Folder for generated quicklook PNGs. Defaults to the script folder.",
+    )
+    parser.add_argument(
+        "--max-geotiffs",
+        type=int,
+        default=8,
+        help="Maximum number of GeoTIFFs to inspect in detail.",
+    )
+    return parser.parse_args()
 
-    root_files = list_files(PROJECT_DIR, "Root folder contents")
+
+def main() -> None:
+    args = parse_args()
+    project_paths: ProjectPaths = resolve_project_paths(args.project_dir)
+    quicklook_dir = args.quicklook_dir.expanduser().resolve()
+
+    print_section("InSAR output inspection")
+    print(f"Project folder: {project_paths.root_dir}")
+    print(f"Product folder: {project_paths.product_dir}")
+    print(f"Quicklook output folder: {quicklook_dir}")
+
+    if project_paths.root_dir != project_paths.product_dir:
+        list_files(project_paths.root_dir, "Bundle folder contents")
+
+    product_files = list_files(project_paths.product_dir, "Product folder contents")
     geotiff_files = [
         path
-        for path in list_files(GEOTIFF_DIR, "geotiffs/ contents")
+        for path in list_files(project_paths.geotiff_dir, "geotiffs/ contents")
         if path.suffix.lower() in {".tif", ".tiff"}
     ]
     csv_files = [
         path
-        for path in list_files(TIMESERIES_DIR, "timeseries/ contents")
+        for path in list_files(project_paths.timeseries_dir, "timeseries/ contents")
         if path.suffix.lower() == ".csv"
     ]
 
-    netcdf_files = prioritize_netcdf_files(root_files)
-    velocity_sbas_netcdf = inspect_netcdf_files(netcdf_files)
-    inspect_geotiff_files(geotiff_files)
+    netcdf_files = prioritize_netcdf_files(product_files)
+    velocity_netcdf = inspect_netcdf_files(netcdf_files)
+    inspect_geotiff_files(geotiff_files, max_files=args.max_geotiffs)
     csv_path = inspect_first_csv(csv_files)
-    create_quicklook(velocity_sbas_netcdf, geotiff_files, csv_path)
+    create_quicklook(velocity_netcdf, geotiff_files, csv_path, quicklook_dir)
 
 
 if __name__ == "__main__":

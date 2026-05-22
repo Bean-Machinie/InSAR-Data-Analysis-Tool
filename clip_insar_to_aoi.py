@@ -1,8 +1,14 @@
 """
-Create AOI-only InSAR outputs from the exported project folder.
+Create AOI-only InSAR outputs from an exported project folder.
+
+Run:
+    python clip_insar_to_aoi.py Data\\project_D_results_only
 
 This script reads the AOI polygon from parameters.json, masks NetCDF variables
 and GeoTIFFs to that polygon, and creates simple AOI-only quicklook plots.
+
+The project folder can be either the outer export bundle or the inner
+outputs/<project>_<orbit> product folder.
 
 Dependency notes:
     pip install xarray netcdf4 rioxarray rasterio pandas matplotlib numpy
@@ -10,36 +16,34 @@ Dependency notes:
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from xml.sax.saxutils import escape
 
-
-PROJECT_DIR = Path(r"E:\Scripts\InSAR-Data-Analysis-Tool\Data\project_dam_D")
-PARAMETERS_PATH = PROJECT_DIR / "parameters.json"
-GEOTIFF_DIR = PROJECT_DIR / "geotiffs"
-OUTPUT_DIR = PROJECT_DIR / "aoi_only"
-OUTPUT_GEOTIFF_DIR = OUTPUT_DIR / "geotiffs"
-
-PREFERRED_NETCDF_INPUTS = (
-    PROJECT_DIR / "results_wide.nc",
-    PROJECT_DIR / "results_tight.nc",
+from insar_project import (
+    DISPLACEMENT_VARIABLES,
+    MAP_VARIABLES,
+    VELOCITY_VARIABLE_CANDIDATES,
+    ProjectPaths,
+    add_project_dir_argument,
+    display_label,
+    find_netcdf_files,
+    first_existing_variable,
+    resolve_project_paths,
 )
 
-MAP_VARIABLES = (
-    "velocity_sbas",
-    "velocity_ps",
-    "rmse_sbas",
-    "rmse_ps",
-    "dem",
-    "psf",
-)
 
-DISPLACEMENT_VARIABLES = (
-    "displacement_sbas",
-    "displacement_ps",
-)
+@dataclass(frozen=True)
+class ClipContext:
+    project_paths: ProjectPaths
+    output_dir: Path
+
+    @property
+    def output_geotiff_dir(self) -> Path:
+        return self.output_dir / "geotiffs"
 
 
 def print_section(title: str) -> None:
@@ -92,12 +96,8 @@ def polygon_to_geojson(coordinates: list[tuple[float, float]]) -> dict:
     }
 
 
-def find_netcdf_input() -> Path | None:
-    for path in PREFERRED_NETCDF_INPUTS:
-        if path.exists():
-            return path
-
-    nc_files = sorted(PROJECT_DIR.glob("*.nc"))
+def find_netcdf_input(project_paths: ProjectPaths) -> Path | None:
+    nc_files = find_netcdf_files(project_paths)
     return nc_files[0] if nc_files else None
 
 
@@ -157,15 +157,18 @@ def print_variable_summary(dataset) -> None:
             print(f"  {name}: min={min_value:.6g}, max={max_value:.6g}")
 
 
-def clip_netcdf_to_aoi(coordinates: list[tuple[float, float]]) -> Path | None:
+def clip_netcdf_to_aoi(
+    context: ClipContext,
+    coordinates: list[tuple[float, float]],
+) -> Path | None:
     import xarray as xr
 
-    source_path = find_netcdf_input()
+    source_path = find_netcdf_input(context.project_paths)
     if source_path is None:
         print("No NetCDF file found. Skipping NetCDF AOI clipping.")
         return None
 
-    output_path = OUTPUT_DIR / "results_aoi_masked.nc"
+    output_path = context.output_dir / "results_aoi_masked.nc"
     lon_min, lat_min, lon_max, lat_max = polygon_bounds(coordinates)
 
     print_section("NetCDF AOI clipping")
@@ -199,13 +202,15 @@ def clip_netcdf_to_aoi(coordinates: list[tuple[float, float]]) -> Path | None:
                     "flag_meanings": "outside_aoi inside_aoi",
                 }
             )
-            masked.attrs["aoi_source"] = str(PARAMETERS_PATH)
-            masked.attrs["aoi_wkt"] = load_parameters(PARAMETERS_PATH)["aoi"]["raw_wkt"]
+            masked.attrs["aoi_source"] = str(context.project_paths.parameters_path)
+            masked.attrs["aoi_wkt"] = load_parameters(
+                context.project_paths.parameters_path
+            )["aoi"]["raw_wkt"]
             masked.attrs["aoi_clip_note"] = (
                 "Variables with lat/lon dimensions are masked to the AOI polygon."
             )
 
-            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+            context.output_dir.mkdir(parents=True, exist_ok=True)
             masked.to_netcdf(output_path)
 
             print(f"Subset dimensions: {dict(masked.sizes)}")
@@ -247,11 +252,11 @@ def choose_raster_nodata(source) -> float | int | None:
     return 0
 
 
-def clip_geotiff(path: Path, geometry: dict) -> Path | None:
+def clip_geotiff(path: Path, geometry: dict, context: ClipContext) -> Path | None:
     import rasterio
     from rasterio.mask import mask
 
-    output_path = OUTPUT_GEOTIFF_DIR / path.name
+    output_path = context.output_geotiff_dir / path.name
 
     try:
         with rasterio.open(path) as source:
@@ -274,7 +279,7 @@ def clip_geotiff(path: Path, geometry: dict) -> Path | None:
                 }
             )
 
-            OUTPUT_GEOTIFF_DIR.mkdir(parents=True, exist_ok=True)
+            context.output_geotiff_dir.mkdir(parents=True, exist_ok=True)
             with rasterio.open(output_path, "w", **profile) as destination:
                 destination.write(data)
 
@@ -293,12 +298,17 @@ def clip_geotiff(path: Path, geometry: dict) -> Path | None:
         return None
 
 
-def clip_geotiffs_to_aoi(coordinates: list[tuple[float, float]]) -> list[Path]:
+def clip_geotiffs_to_aoi(
+    context: ClipContext,
+    coordinates: list[tuple[float, float]],
+) -> list[Path]:
     print_section("GeoTIFF AOI clipping")
 
     geotiff_files = sorted(
-        path for path in GEOTIFF_DIR.iterdir() if path.suffix.lower() in {".tif", ".tiff"}
-    ) if GEOTIFF_DIR.exists() else []
+        path
+        for path in context.project_paths.geotiff_dir.iterdir()
+        if path.suffix.lower() in {".tif", ".tiff"}
+    ) if context.project_paths.geotiff_dir.exists() else []
 
     if not geotiff_files:
         print("No GeoTIFF files found. Skipping GeoTIFF AOI clipping.")
@@ -306,17 +316,20 @@ def clip_geotiffs_to_aoi(coordinates: list[tuple[float, float]]) -> list[Path]:
 
     geometry = polygon_to_geojson(coordinates)
     written_paths = []
-    print(f"Clipping {len(geotiff_files)} GeoTIFF files to: {OUTPUT_GEOTIFF_DIR}")
+    print(f"Clipping {len(geotiff_files)} GeoTIFF files to: {context.output_geotiff_dir}")
     for path in geotiff_files:
-        output_path = clip_geotiff(path, geometry)
+        output_path = clip_geotiff(path, geometry, context)
         if output_path is not None:
             written_paths.append(output_path)
 
     return written_paths
 
 
-def save_aoi_geojson(coordinates: list[tuple[float, float]]) -> Path:
-    output_path = OUTPUT_DIR / "aoi_polygon.geojson"
+def save_aoi_geojson(
+    context: ClipContext,
+    coordinates: list[tuple[float, float]],
+) -> Path:
+    output_path = context.output_dir / "aoi_polygon.geojson"
     feature_collection = {
         "type": "FeatureCollection",
         "name": "aoi_polygon",
@@ -324,8 +337,8 @@ def save_aoi_geojson(coordinates: list[tuple[float, float]]) -> Path:
             {
                 "type": "Feature",
                 "properties": {
-                    "name": "project_dam_D_AOI",
-                    "source": str(PARAMETERS_PATH),
+                    "name": f"{context.project_paths.product_dir.name}_AOI",
+                    "source": str(context.project_paths.parameters_path),
                     "crs": "EPSG:4326",
                 },
                 "geometry": polygon_to_geojson(coordinates),
@@ -400,16 +413,18 @@ def save_qgis_velocity_style(raster_path: Path, label: str) -> Path | None:
 
 
 def save_qgis_support_files(
+    context: ClipContext,
     coordinates: list[tuple[float, float]],
     geotiff_paths: list[Path],
 ) -> None:
     print_section("QGIS support files")
-    save_aoi_geojson(coordinates)
+    save_aoi_geojson(context, coordinates)
 
     by_name = {path.name.lower(): path for path in geotiff_paths}
     for filename, label in (
+        ("sbas_velocity_masked.tif", "AOI SBAS masked velocity"),
+        ("sbas_velocity_raw.tif", "AOI SBAS raw velocity"),
         ("velocity_sbas.tif", "AOI SBAS velocity"),
-        ("velocity_ps.tif", "AOI PS velocity"),
     ):
         raster_path = by_name.get(filename)
         if raster_path is None:
@@ -418,7 +433,7 @@ def save_qgis_support_files(
         save_qgis_velocity_style(raster_path, label)
 
 
-def plot_aoi_velocity(netcdf_path: Path | None) -> Path | None:
+def plot_aoi_velocity(context: ClipContext, netcdf_path: Path | None) -> Path | None:
     if netcdf_path is None:
         print("No AOI NetCDF available for velocity quicklook.")
         return None
@@ -426,33 +441,34 @@ def plot_aoi_velocity(netcdf_path: Path | None) -> Path | None:
     import matplotlib.pyplot as plt
     import xarray as xr
 
-    output_path = OUTPUT_DIR / "aoi_velocity_sbas.png"
-
     try:
         with xr.open_dataset(netcdf_path) as dataset:
-            if "velocity_sbas" not in dataset:
-                print("velocity_sbas not found. Skipping AOI velocity quicklook.")
+            variable = first_existing_variable(dataset, VELOCITY_VARIABLE_CANDIDATES)
+            if variable is None:
+                print("No SBAS velocity variable found. Skipping AOI velocity quicklook.")
                 return None
 
-            velocity = dataset["velocity_sbas"]
+            velocity = dataset[variable]
             min_value, max_value = finite_min_max(velocity)
             if min_value is None or max_value is None:
-                print("velocity_sbas has no finite AOI pixels. Skipping quicklook.")
+                print(f"{variable} has no finite AOI pixels. Skipping quicklook.")
                 return None
 
             max_abs = max(abs(min_value), abs(max_value))
+            output_path = context.output_dir / f"aoi_{variable}.png"
 
             plt.figure(figsize=(8, 6))
             velocity.plot(
                 cmap="RdBu_r",
                 vmin=-max_abs,
                 vmax=max_abs,
-                cbar_kwargs={"label": "SBAS velocity (mm/year)"},
+                cbar_kwargs={"label": f"{display_label(variable)} (mm/year)"},
             )
-            plt.title("AOI-only SBAS velocity")
+            plt.title(f"AOI-only {display_label(variable)}")
             plt.xlabel("Longitude")
             plt.ylabel("Latitude")
             plt.tight_layout()
+            context.output_dir.mkdir(parents=True, exist_ok=True)
             plt.savefig(output_path, dpi=150)
             plt.close()
 
@@ -463,7 +479,10 @@ def plot_aoi_velocity(netcdf_path: Path | None) -> Path | None:
         return None
 
 
-def save_mean_displacement_timeseries(netcdf_path: Path | None) -> Path | None:
+def save_mean_displacement_timeseries(
+    context: ClipContext,
+    netcdf_path: Path | None,
+) -> Path | None:
     if netcdf_path is None:
         return None
 
@@ -471,8 +490,8 @@ def save_mean_displacement_timeseries(netcdf_path: Path | None) -> Path | None:
     import pandas as pd
     import xarray as xr
 
-    output_csv = OUTPUT_DIR / "aoi_mean_displacement_timeseries.csv"
-    output_png = OUTPUT_DIR / "aoi_mean_displacement_timeseries.png"
+    output_csv = context.output_dir / "aoi_mean_displacement_timeseries.csv"
+    output_png = context.output_dir / "aoi_mean_displacement_timeseries.png"
 
     try:
         with xr.open_dataset(netcdf_path) as dataset:
@@ -496,6 +515,7 @@ def save_mean_displacement_timeseries(netcdf_path: Path | None) -> Path | None:
             print("No displacement variables found. Skipping AOI mean displacement time series.")
             return None
 
+        context.output_dir.mkdir(parents=True, exist_ok=True)
         table.to_csv(output_csv, index=False)
 
         plt.figure(figsize=(8, 4))
@@ -520,13 +540,34 @@ def save_mean_displacement_timeseries(netcdf_path: Path | None) -> Path | None:
         return None
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    add_project_dir_argument(parser)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="AOI output folder. Defaults to <product folder>/aoi_only.",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
+    project_paths = resolve_project_paths(args.project_dir)
+    output_dir = (
+        args.output_dir.expanduser().resolve()
+        if args.output_dir is not None
+        else project_paths.aoi_output_dir
+    )
+    context = ClipContext(project_paths=project_paths, output_dir=output_dir)
+
     print_section("AOI-only InSAR clipping")
-    print(f"Project folder: {PROJECT_DIR}")
-    print(f"Output folder:  {OUTPUT_DIR}")
+    print(f"Project folder: {project_paths.root_dir}")
+    print(f"Product folder: {project_paths.product_dir}")
+    print(f"Output folder:  {context.output_dir}")
 
     try:
-        parameters = load_parameters(PARAMETERS_PATH)
+        parameters = load_parameters(project_paths.parameters_path)
         raw_wkt = parameters["aoi"]["raw_wkt"]
         coordinates = parse_polygon_wkt(raw_wkt)
     except Exception as exc:
@@ -536,12 +577,12 @@ def main() -> None:
     print(f"AOI polygon vertices: {len(coordinates)}")
     print(f"AOI WKT: {raw_wkt}")
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    aoi_netcdf_path = clip_netcdf_to_aoi(coordinates)
-    aoi_geotiff_paths = clip_geotiffs_to_aoi(coordinates)
-    save_qgis_support_files(coordinates, aoi_geotiff_paths)
-    plot_aoi_velocity(aoi_netcdf_path)
-    save_mean_displacement_timeseries(aoi_netcdf_path)
+    context.output_dir.mkdir(parents=True, exist_ok=True)
+    aoi_netcdf_path = clip_netcdf_to_aoi(context, coordinates)
+    aoi_geotiff_paths = clip_geotiffs_to_aoi(context, coordinates)
+    save_qgis_support_files(context, coordinates, aoi_geotiff_paths)
+    plot_aoi_velocity(context, aoi_netcdf_path)
+    save_mean_displacement_timeseries(context, aoi_netcdf_path)
 
 
 if __name__ == "__main__":
