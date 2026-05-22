@@ -1457,6 +1457,8 @@ APP_HTML = r"""<!DOCTYPE html>
     }
 
     function routeMapClick(event) {
+      if (event.insarHandled) return;
+      event.insarHandled = true;
       document.body.dataset.lastMapClick = `${event.clientX},${event.clientY}`;
       const rect = document.getElementById("map").getBoundingClientRect();
       const point = L.point(event.clientX - rect.left, event.clientY - rect.top);
