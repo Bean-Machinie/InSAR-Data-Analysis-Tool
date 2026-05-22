@@ -1047,6 +1047,7 @@ APP_HTML = r"""<!DOCTYPE html>
   <div id="toast" class="toast panel-hidden"></div>
 
   <script>
+    const PRIMARY_DISPLACEMENT_LAYER = "sbas_displacement_masked";
     const state = {
       map: null,
       payload: null,
