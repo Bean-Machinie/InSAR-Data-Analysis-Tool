@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -51,6 +52,8 @@ TEXT_MUTED = "#5d6970"
 class ViewerData:
     dataset_path: Path
     parameters_path: Path
+    aoi_lons: np.ndarray | None
+    aoi_lats: np.ndarray | None
     variables: tuple[str, ...]
     dates: pd.DatetimeIndex
     latitudes: np.ndarray
@@ -73,6 +76,46 @@ def load_parameters(parameters_path: Path) -> dict:
         return {}
     with parameters_path.open("r", encoding="utf-8") as file:
         return json.load(file)
+
+
+def parse_polygon_wkt(wkt: str | None) -> list[tuple[float, float]]:
+    if not wkt:
+        return []
+
+    match = re.match(r"^\s*POLYGON\s*\(\((.+)\)\)\s*$", wkt, flags=re.IGNORECASE)
+    if not match:
+        return []
+
+    coordinates = []
+    for point in match.group(1).split(","):
+        parts = point.strip().split()
+        if len(parts) < 2:
+            return []
+        coordinates.append((float(parts[0]), float(parts[1])))
+
+    if coordinates and coordinates[0] != coordinates[-1]:
+        coordinates.append(coordinates[0])
+
+    return coordinates
+
+
+def make_polygon_mask(
+    lon_values: np.ndarray,
+    lat_values: np.ndarray,
+    coordinates: list[tuple[float, float]],
+) -> np.ndarray | None:
+    if len(coordinates) < 4:
+        return None
+
+    try:
+        from matplotlib.path import Path as MatplotlibPath
+    except ImportError:
+        return None
+
+    lon_grid, lat_grid = np.meshgrid(lon_values, lat_values)
+    points = np.column_stack([lon_grid.ravel(), lat_grid.ravel()])
+    mask = MatplotlibPath(coordinates).contains_points(points, radius=1e-12)
+    return mask.reshape((len(lat_values), len(lon_values)))
 
 
 def nearest_pixel_id(
@@ -110,9 +153,20 @@ def load_viewer_data(dataset_path: Path, parameters_path: Path) -> ViewerData:
     latitudes = dataset["lat"].values
     longitudes = dataset["lon"].values
     dates = pd.DatetimeIndex(pd.to_datetime(dataset["date"].values))
+    parameters = load_parameters(parameters_path)
+    aoi_coordinates = parse_polygon_wkt((parameters.get("aoi") or {}).get("raw_wkt"))
+    aoi_lons = np.array([lon for lon, _lat in aoi_coordinates]) if aoi_coordinates else None
+    aoi_lats = np.array([lat for _lon, lat in aoi_coordinates]) if aoi_coordinates else None
 
     if "aoi_mask" in dataset:
         mask = dataset["aoi_mask"].values.astype(bool)
+    elif aoi_coordinates:
+        polygon_mask = make_polygon_mask(longitudes, latitudes, aoi_coordinates)
+        if polygon_mask is not None:
+            mask = polygon_mask
+        else:
+            first_variable = dataset[variables[0]].transpose("date", "lat", "lon").values
+            mask = np.isfinite(first_variable).any(axis=0)
     else:
         first_variable = dataset[variables[0]].transpose("date", "lat", "lon").values
         mask = np.isfinite(first_variable).any(axis=0)
@@ -165,7 +219,6 @@ def load_viewer_data(dataset_path: Path, parameters_path: Path) -> ViewerData:
         )
 
     default_selected_ids = [int(default_candidates[0])] if len(default_candidates) else []
-    parameters = load_parameters(parameters_path)
     pois = parameters.get("pois") or []
     if pois:
         lon = pois[0].get("lon")
@@ -184,6 +237,8 @@ def load_viewer_data(dataset_path: Path, parameters_path: Path) -> ViewerData:
     return ViewerData(
         dataset_path=dataset_path,
         parameters_path=parameters_path,
+        aoi_lons=aoi_lons,
+        aoi_lats=aoi_lats,
         variables=variables,
         dates=dates,
         latitudes=latitudes,
@@ -314,6 +369,19 @@ def build_map_figure(
         )
     )
 
+    if VIEWER_DATA.aoi_lons is not None and VIEWER_DATA.aoi_lats is not None:
+        figure.add_trace(
+            go.Scatter(
+                x=VIEWER_DATA.aoi_lons,
+                y=VIEWER_DATA.aoi_lats,
+                mode="lines",
+                line={"color": "#172126", "width": 2},
+                hoverinfo="skip",
+                showlegend=False,
+                name="AOI outline",
+            )
+        )
+
     if selected_ids_clean:
         figure.add_trace(
             go.Scattergl(
@@ -343,13 +411,13 @@ def build_map_figure(
             "font": {"size": 15, "color": TEXT_MAIN},
         },
         xaxis={
-            "title": "Longitude",
+            "title": "Longitude (W negative)",
             "showgrid": True,
             "gridcolor": "#e6ecef",
             "zeroline": False,
         },
         yaxis={
-            "title": "Latitude",
+            "title": "Latitude (S negative)",
             "showgrid": True,
             "gridcolor": "#e6ecef",
             "zeroline": False,
