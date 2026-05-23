@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Path \"e:\\\\Scripts\\\\InSAR-Data-Analysis-Tool\" -Force)",
+      "Bash(Select-Object Name, PSIsContainer)",
+      "Bash(Format-Table -AutoSize)",
+      "Bash(timeout 8 \".venv/Scripts/python.exe\" insar_deformation_viewer.py Data/project_D_results_only --host 127.0.0.1 --port 8055)",
+      "Bash(curl -s http://127.0.0.1:8055/api/viewer)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\('title:', d['title']\\); print\\('layers:', len\\(d['dataLayers']\\)\\); print\\('pois:', len\\(d['pois']\\)\\); print\\('dates:', len\\(d['dates']\\)\\)\")",
+      "Bash(curl -s -o /dev/null -w \"overlay status: %{http_code}\\\\n\" http://127.0.0.1:8055/overlay/sbas_velocity_masked/0.png)",
+      "Bash(curl -s -o /dev/null -w \"coh-filter status: %{http_code}\\\\n\" http://127.0.0.1:8055/overlay/velocity_coh_filtered/45.png)",
+      "Bash(curl -s -o /dev/null -w \"metadata status: %{http_code}\\\\n\" http://127.0.0.1:8055/api/metadata)",
+      "Bash(kill %1)",
+      "Bash(.venv/Scripts/python.exe -c ' *)"
+    ]
+  }
+}

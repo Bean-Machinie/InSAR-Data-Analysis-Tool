@@ -1,19 +1,19 @@
-"""
-Fast Leaflet viewer for SBAS maps and pixel deformation time series.
+"""InSAR SBAS Results Viewer
+
+Flask + Leaflet + Plotly.js viewer for one SBAS processing run.
+
+Inputs (from the product folder):
+    results_tight.nc              — main NetCDF with all maps and time-series cubes
+    parameters.json               — AOI WKT, processing parameters, POI list
+    sbas_results_metadata.json    — units, thresholds, array shapes, notes
 
 Run:
-    python insar_deformation_viewer.py Data\\project_D_results_only
+    python insar_deformation_viewer.py Data/project_D_results_only
+    open http://127.0.0.1:8050
 
-Then open:
-    http://127.0.0.1:8050
-
-The project folder can be either the outer export bundle or the inner
-outputs/<project>_<orbit> product folder.
-
-Dependency notes:
+Dependencies:
     pip install flask xarray netcdf4 pandas matplotlib pillow numpy
 """
-
 from __future__ import annotations
 
 import argparse
@@ -24,6 +24,7 @@ import re
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -33,12 +34,32 @@ from matplotlib import colormaps
 from matplotlib.colors import Normalize, TwoSlopeNorm
 from PIL import Image
 
-from insar_project import ProjectPaths, add_project_dir_argument, find_netcdf_files, resolve_project_paths
+from insar_project import (
+    ProjectPaths,
+    add_project_dir_argument,
+    find_netcdf_files,
+    resolve_project_paths,
+)
 
+
+# ── Runtime constants ──────────────────────────────────────────────────────────
 
 DEFAULT_ZOOM = 13
-PRIMARY_DISPLACEMENT_LAYER = "sbas_displacement_masked"
+DEFAULT_COH_THRESHOLD = 0.45   # conservative customer default (processing typically uses 0.30)
+COH_SLIDER_STEP = 0.05
+SEGMENT_COLORS = ["#2166ac", "#e08214", "#4dac26", "#9e0142", "#abd9e9"]
 
+# Variables loaded only for pixel-level queries (not rendered as map overlays)
+PIXEL_SERIES_VARS: dict[str, str] = {
+    "raw": "sbas_displacement_raw",
+    "segmented": "sbas_displacement_segmented_same_pixel",
+    "segment_id": "sbas_segment_id",
+    "valid_time_mask": "sbas_valid_time_mask",
+    "coh_per_date": "coherence_per_date",
+}
+
+
+# ── Spec dataclasses ───────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
 class TileLayerSpec:
@@ -56,7 +77,7 @@ class DataLayerSpec:
     key: str
     label: str
     variable: str | None
-    kind: str
+    kind: str            # 'scalar' | 'mask' | 'aoi'
     units: str
     colormap: str
     default_enabled: bool
@@ -65,116 +86,104 @@ class DataLayerSpec:
     symmetric: bool = False
 
 
-@dataclass(frozen=True)
-class ViewerData:
-    dataset_path: Path
-    parameters_path: Path
-    title: str
-    dates: pd.DatetimeIndex
-    latitudes: np.ndarray
-    longitudes: np.ndarray
-    lat_edges: np.ndarray
-    lon_edges: np.ndarray
-    spatial_mask: np.ndarray
-    layer_specs: tuple[DataLayerSpec, ...]
-    layer_ranges: dict[str, tuple[float, float]]
-    static_values: dict[str, np.ndarray]
-    temporal_values: dict[str, np.ndarray]
-    displacement_labels: dict[str, str]
-    aoi_lons: np.ndarray | None
-    aoi_lats: np.ndarray | None
-    center_lat: float
-    center_lon: float
-
-
 BASEMAP_SPECS: tuple[TileLayerSpec, ...] = (
     TileLayerSpec(
         key="esri_satellite",
         label="Esri Satellite",
         url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-        attribution="Tiles (c) Esri",
+        attribution="Tiles &copy; Esri",
         default_enabled=True,
         default_opacity=1.0,
         max_zoom=18,
     ),
     TileLayerSpec(
+        key="esri_hillshade",
+        label="Esri Hillshade",
+        url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Shaded_Relief/MapServer/tile/{z}/{y}/{x}",
+        attribution="Tiles &copy; Esri",
+        default_enabled=False,
+        default_opacity=1.0,
+        max_zoom=13,
+    ),
+    TileLayerSpec(
         key="openstreetmap",
         label="OpenStreetMap",
         url="https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-        attribution="(c) OpenStreetMap contributors",
+        attribution="&copy; OpenStreetMap contributors",
         default_enabled=False,
-        default_opacity=0.85,
+        default_opacity=0.9,
         max_zoom=19,
-    ),
-    TileLayerSpec(
-        key="carto_light",
-        label="Carto Light",
-        url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
-        attribution="(c) OpenStreetMap contributors (c) CARTO",
-        default_enabled=False,
-        default_opacity=0.8,
-        max_zoom=20,
     ),
 )
 
 REQUESTED_DATA_LAYERS: tuple[DataLayerSpec, ...] = (
     DataLayerSpec(
-        key="sbas_displacement_masked",
-        label="SBAS displacement (masked) [mm]",
-        variable="sbas_displacement_masked",
+        key="sbas_velocity_masked",
+        label="Velocity — masked (mm/yr)",
+        variable="sbas_velocity_masked",
         kind="scalar",
-        units="mm",
+        units="mm/yr",
         colormap="RdBu_r",
         default_enabled=True,
-        default_opacity=0.86,
-        temporal=True,
+        default_opacity=0.87,
         symmetric=True,
     ),
     DataLayerSpec(
         key="sbas_velocity_raw",
-        label="SBAS velocity (raw) [mm/year]",
+        label="Velocity — raw (mm/yr)",
         variable="sbas_velocity_raw",
         kind="scalar",
-        units="mm/year",
+        units="mm/yr",
         colormap="RdBu_r",
         default_enabled=False,
         default_opacity=0.82,
         symmetric=True,
     ),
     DataLayerSpec(
-        key="sbas_velocity_masked",
-        label="SBAS velocity (masked) [mm/year]",
-        variable="sbas_velocity_masked",
+        key="sbas_displacement_masked",
+        label="Displacement — masked (mm)",
+        variable="sbas_displacement_masked",
         kind="scalar",
-        units="mm/year",
+        units="mm",
         colormap="RdBu_r",
         default_enabled=False,
         default_opacity=0.86,
+        temporal=True,
         symmetric=True,
     ),
     DataLayerSpec(
         key="coherence_median",
-        label="Coherence (median across pairs)",
+        label="Coherence (median)",
         variable="coherence_median",
         kind="scalar",
-        units="coherence",
+        units="",
         colormap="viridis",
         default_enabled=False,
-        default_opacity=0.76,
+        default_opacity=0.78,
     ),
     DataLayerSpec(
         key="valid_pixel_mask",
-        label="valid_pixel_mask (coh >= 0.3)",
+        label="Valid pixel mask",
         variable="valid_pixel_mask",
         kind="mask",
-        units="valid",
+        units="",
         colormap="mask",
         default_enabled=False,
-        default_opacity=0.62,
+        default_opacity=0.65,
+    ),
+    DataLayerSpec(
+        key="dem",
+        label="DEM (terrain elevation, m)",
+        variable="dem",
+        kind="scalar",
+        units="m",
+        colormap="terrain",
+        default_enabled=False,
+        default_opacity=0.72,
     ),
     DataLayerSpec(
         key="aoi_original",
-        label="AOI (original)",
+        label="AOI boundary",
         variable=None,
         kind="aoi",
         units="",
@@ -184,191 +193,215 @@ REQUESTED_DATA_LAYERS: tuple[DataLayerSpec, ...] = (
     ),
 )
 
-DISPLACEMENT_VARIABLES = (
-    ("sbas_displacement_masked", "SBAS masked displacement"),
-    ("sbas_displacement_raw", "SBAS raw displacement"),
-    ("sbas_displacement_segmented_same_pixel", "SBAS segmented displacement"),
-    ("displacement_sbas", "SBAS displacement"),
-)
 
-SERIES_COLORS = {
-    "sbas_displacement_masked": "#126a65",
-    "sbas_displacement_raw": "#2f5f9f",
-    "sbas_displacement_segmented_same_pixel": "#8b4ec7",
-    "displacement_sbas": "#126a65",
-}
+# ── ViewerData ─────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class ViewerData:
+    dataset_path: Path
+    title: str
+    dates: pd.DatetimeIndex
+    latitudes: np.ndarray
+    longitudes: np.ndarray
+    lat_edges: np.ndarray
+    lon_edges: np.ndarray
+    spatial_mask: np.ndarray                  # [lat, lon] bool
+    layer_specs: tuple[DataLayerSpec, ...]
+    layer_ranges: dict[str, tuple[float, float]]
+    static_values: dict[str, np.ndarray]      # [lat, lon] for overlay rendering
+    temporal_values: dict[str, np.ndarray]    # [date, lat, lon] for overlay rendering
+    pixel_series: dict[str, np.ndarray]       # [date, lat, lon] for pixel queries only
+    pois: tuple[dict, ...]
+    metadata: dict[str, Any]
+    parameters: dict[str, Any]
+    aoi_lons: np.ndarray | None
+    aoi_lats: np.ndarray | None
+    center_lat: float
+    center_lon: float
+
 
 VIEWER_DATA: ViewerData | None = None
 
 
+# ── Data loading ───────────────────────────────────────────────────────────────
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     add_project_dir_argument(parser)
-    parser.add_argument(
-        "--dataset",
-        type=Path,
-        help="NetCDF dataset to view. Defaults to results_tight.nc, then AOI, then results_wide.nc.",
-    )
-    parser.add_argument("--host", default="127.0.0.1", help="Viewer host.")
-    parser.add_argument("--port", type=int, default=8050, help="Viewer port.")
-    parser.add_argument("--debug", action="store_true", help="Run Flask in debug mode.")
+    parser.add_argument("--dataset", type=Path, help="Override NetCDF path.")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8050)
+    parser.add_argument("--debug", action="store_true")
     return parser.parse_args()
 
 
 def default_dataset_path(project_paths: ProjectPaths) -> Path:
-    candidates = (
+    for candidate in (
         project_paths.product_dir / "results_tight.nc",
-        project_paths.aoi_output_dir / "results_aoi_masked.nc",
+        project_paths.product_dir / "results_aoi_masked.nc",
         project_paths.product_dir / "results_wide.nc",
-    )
-    for path in candidates:
-        if path.exists():
-            return path
-
+    ):
+        if candidate.exists():
+            return candidate
     nc_files = find_netcdf_files(project_paths)
     if nc_files:
         return nc_files[0]
-
-    raise FileNotFoundError(
-        f"No NetCDF dataset found under product folder: {project_paths.product_dir}"
-    )
+    raise FileNotFoundError(f"No NetCDF dataset found under {project_paths.product_dir}")
 
 
-def load_parameters(parameters_path: Path) -> dict:
-    if not parameters_path.exists():
-        return {}
-    with parameters_path.open("r", encoding="utf-8") as file:
-        return json.load(file)
+def load_json_safe(path: Path) -> dict:
+    if path.exists():
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
 
 
 def parse_polygon_wkt(wkt: str | None) -> list[tuple[float, float]]:
     if not wkt:
         return []
-
     match = re.match(r"^\s*POLYGON\s*\(\((.+)\)\)\s*$", wkt, flags=re.IGNORECASE)
     if not match:
         return []
-
-    coordinates = []
+    coords: list[tuple[float, float]] = []
     for point in match.group(1).split(","):
         parts = point.strip().split()
         if len(parts) < 2:
             return []
-        coordinates.append((float(parts[0]), float(parts[1])))
-
-    if coordinates and coordinates[0] != coordinates[-1]:
-        coordinates.append(coordinates[0])
-
-    return coordinates
-
-
-def make_polygon_mask(
-    lon_values: np.ndarray,
-    lat_values: np.ndarray,
-    coordinates: list[tuple[float, float]],
-) -> np.ndarray | None:
-    if len(coordinates) < 4:
-        return None
-
-    try:
-        from matplotlib.path import Path as MatplotlibPath
-    except ImportError:
-        return None
-
-    lon_grid, lat_grid = np.meshgrid(lon_values, lat_values)
-    points = np.column_stack([lon_grid.ravel(), lat_grid.ravel()])
-    mask = MatplotlibPath(coordinates).contains_points(points, radius=1e-12)
-    return mask.reshape((len(lat_values), len(lon_values)))
+        coords.append((float(parts[0]), float(parts[1])))
+    if coords and coords[0] != coords[-1]:
+        coords.append(coords[0])
+    return coords
 
 
 def coordinate_edges(values: np.ndarray) -> np.ndarray:
     values = np.asarray(values, dtype="float64")
     if values.size == 1:
-        delta = 0.0001
-        return np.array([values[0] - delta / 2, values[0] + delta / 2])
-
+        d = 0.0001
+        return np.array([values[0] - d / 2, values[0] + d / 2])
     midpoints = (values[:-1] + values[1:]) / 2
     first = values[0] - (midpoints[0] - values[0])
     last = values[-1] + (values[-1] - midpoints[-1])
     return np.concatenate([[first], midpoints, [last]])
 
 
-def build_spatial_mask(dataset, latitudes: np.ndarray, longitudes: np.ndarray, aoi_coordinates) -> np.ndarray:
+def build_spatial_mask(
+    dataset: xr.Dataset,
+    latitudes: np.ndarray,
+    longitudes: np.ndarray,
+    aoi_coords: list[tuple[float, float]],
+) -> np.ndarray:
     if "aoi_mask" in dataset:
         return dataset["aoi_mask"].transpose("lat", "lon").values.astype(bool)
 
-    if aoi_coordinates:
-        polygon_mask = make_polygon_mask(longitudes, latitudes, aoi_coordinates)
-        if polygon_mask is not None:
-            return polygon_mask
+    if aoi_coords:
+        try:
+            from matplotlib.path import Path as MplPath
+            lon_grid, lat_grid = np.meshgrid(longitudes, latitudes)
+            points = np.column_stack([lon_grid.ravel(), lat_grid.ravel()])
+            mask = MplPath(aoi_coords).contains_points(points, radius=1e-12)
+            return mask.reshape((len(latitudes), len(longitudes)))
+        except ImportError:
+            pass
 
-    candidate_masks = []
+    candidates = []
     for spec in REQUESTED_DATA_LAYERS:
-        if spec.variable and spec.variable in dataset:
-            values = dataset[spec.variable]
-            if "date" in values.dims:
-                array = values.transpose("date", "lat", "lon").values
-                candidate_masks.append(np.isfinite(array).any(axis=0))
-            else:
-                array = values.transpose("lat", "lon").values
-                candidate_masks.append(np.isfinite(array))
+        if spec.variable is None or spec.variable not in dataset.data_vars:
+            continue
+        var = dataset[spec.variable]
+        if "date" in var.dims:
+            arr = var.transpose("date", "lat", "lon").values
+            candidates.append(np.isfinite(arr).any(axis=0))
+        else:
+            arr = var.transpose("lat", "lon").values
+            candidates.append(np.isfinite(arr))
 
-    if not candidate_masks:
-        raise ValueError("No spatial data layers were found in the dataset.")
-
-    return np.logical_or.reduce(candidate_masks)
+    if not candidates:
+        raise ValueError("No spatial data layers found in dataset.")
+    return np.logical_or.reduce(candidates)
 
 
 def robust_range(values: np.ndarray, mask: np.ndarray, symmetric: bool) -> tuple[float, float]:
-    if values.ndim == 3:
-        finite = values[:, mask]
-    else:
-        finite = values[mask]
-    finite = finite[np.isfinite(finite)]
-
-    if finite.size == 0:
+    flat = values[:, mask] if values.ndim == 3 else values[mask]
+    flat = flat[np.isfinite(flat)]
+    if flat.size == 0:
         return (-1.0, 1.0) if symmetric else (0.0, 1.0)
-
     if symmetric:
-        limit = float(np.nanpercentile(np.abs(finite), 98))
+        limit = float(np.nanpercentile(np.abs(flat), 98))
         if not math.isfinite(limit) or limit == 0:
             limit = 1.0
         return -limit, limit
-
-    low, high = np.nanpercentile(finite, [2, 98])
-    if not math.isfinite(float(low)) or not math.isfinite(float(high)) or low == high:
-        low = float(np.nanmin(finite))
-        high = float(np.nanmax(finite))
+    low = float(np.nanpercentile(flat, 2))
+    high = float(np.nanpercentile(flat, 98))
+    if low == high:
+        low, high = float(np.nanmin(flat)), float(np.nanmax(flat))
     if low == high:
         high = low + 1.0
-    return float(low), float(high)
+    return low, high
 
 
-def load_viewer_data(dataset_path: Path, parameters_path: Path) -> ViewerData:
+def _parse_poi_latlon_from_csv(path: Path) -> tuple[float | None, float | None]:
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                if not line.startswith("#"):
+                    break
+                m = re.search(r"lon\s*=\s*([-\d.]+).*lat\s*=\s*([-\d.]+)", line)
+                if m:
+                    return float(m.group(2)), float(m.group(1))
+    except OSError:
+        pass
+    return None, None
+
+
+def load_pois(project_paths: ProjectPaths, parameters: dict) -> tuple[dict, ...]:
+    pois: list[dict] = []
+    for poi in parameters.get("pois", []):
+        name = poi.get("name", "")
+        lat = poi.get("lat")
+        lon = poi.get("lon")
+        if not name or lat is None or lon is None:
+            continue
+        has_csv = (project_paths.timeseries_dir / f"{name}.csv").exists()
+        pois.append({"name": name, "lat": float(lat), "lon": float(lon), "has_csv": has_csv})
+
+    existing = {p["name"] for p in pois}
+    if project_paths.timeseries_dir.exists():
+        for csv_path in sorted(project_paths.timeseries_dir.glob("*.csv")):
+            if csv_path.stem not in existing:
+                lat, lon = _parse_poi_latlon_from_csv(csv_path)
+                if lat is not None and lon is not None:
+                    pois.append({"name": csv_path.stem, "lat": lat, "lon": lon, "has_csv": True})
+
+    return tuple(pois)
+
+
+def load_viewer_data(dataset_path: Path, project_paths: ProjectPaths) -> ViewerData:
     if not dataset_path.exists():
-        raise FileNotFoundError(f"Dataset was not found: {dataset_path}")
+        raise FileNotFoundError(f"Dataset not found: {dataset_path}")
 
-    parameters = load_parameters(parameters_path)
-    aoi_coordinates = parse_polygon_wkt((parameters.get("aoi") or {}).get("raw_wkt"))
-    aoi_lons = np.array([lon for lon, _lat in aoi_coordinates]) if aoi_coordinates else None
-    aoi_lats = np.array([lat for _lon, lat in aoi_coordinates]) if aoi_coordinates else None
+    parameters = load_json_safe(project_paths.parameters_path)
+    metadata = load_json_safe(project_paths.metadata_path)
 
-    with xr.open_dataset(dataset_path) as dataset:
-        dataset = dataset.sortby("lat").sortby("lon").load()
+    aoi_wkt = (parameters.get("aoi") or {}).get("raw_wkt")
+    aoi_coords = parse_polygon_wkt(aoi_wkt)
+    aoi_lons = np.array([lon for lon, _ in aoi_coords]) if aoi_coords else None
+    aoi_lats = np.array([lat for _, lat in aoi_coords]) if aoi_coords else None
+
+    with xr.open_dataset(dataset_path) as raw_ds:
+        dataset = raw_ds.sortby("lat").sortby("lon").load()
 
     if "lat" not in dataset.coords or "lon" not in dataset.coords:
-        raise ValueError("Dataset must contain lat and lon coordinates.")
+        raise ValueError("Dataset must have lat/lon coordinates.")
 
     latitudes = dataset["lat"].values.astype("float64")
     longitudes = dataset["lon"].values.astype("float64")
-    spatial_mask = build_spatial_mask(dataset, latitudes, longitudes, aoi_coordinates)
+    spatial_mask = build_spatial_mask(dataset, latitudes, longitudes, aoi_coords)
 
     if not np.any(spatial_mask):
-        raise ValueError("No pixels are available inside the selected spatial mask.")
+        raise ValueError("No pixels inside the spatial mask.")
 
     layer_specs = tuple(
-        spec
-        for spec in REQUESTED_DATA_LAYERS
+        spec for spec in REQUESTED_DATA_LAYERS
         if spec.kind == "aoi" or (spec.variable is not None and spec.variable in dataset.data_vars)
     )
 
@@ -379,36 +412,42 @@ def load_viewer_data(dataset_path: Path, parameters_path: Path) -> ViewerData:
     for spec in layer_specs:
         if spec.variable is None:
             continue
+        var = dataset[spec.variable]
         if spec.temporal:
-            values = dataset[spec.variable].transpose("date", "lat", "lon").values.astype("float64")
-            temporal_values[spec.key] = values
+            arr = var.transpose("date", "lat", "lon").values.astype("float64")
+            temporal_values[spec.key] = arr
         else:
-            values = dataset[spec.variable].transpose("lat", "lon").values.astype("float64")
-            static_values[spec.key] = values
-
-        layer_ranges[spec.key] = (0.0, 1.0) if spec.kind == "mask" else robust_range(values, spatial_mask, spec.symmetric)
+            arr = var.transpose("lat", "lon").values.astype("float64")
+            static_values[spec.key] = arr
+        if spec.kind == "mask":
+            layer_ranges[spec.key] = (0.0, 1.0)
+        else:
+            layer_ranges[spec.key] = robust_range(arr, spatial_mask, spec.symmetric)
 
     if "date" in dataset.coords:
         dates = pd.DatetimeIndex(pd.to_datetime(dataset["date"].values))
     else:
         dates = pd.DatetimeIndex([])
 
-    displacement_labels: dict[str, str] = {}
-    for variable, label in DISPLACEMENT_VARIABLES:
-        if variable not in dataset.data_vars or "date" not in dataset[variable].dims:
+    # Pixel-level query arrays — not used for overlay rendering
+    pixel_series: dict[str, np.ndarray] = {}
+    for key, var_name in PIXEL_SERIES_VARS.items():
+        if var_name not in dataset.data_vars:
             continue
-        if variable not in temporal_values:
-            temporal_values[variable] = dataset[variable].transpose("date", "lat", "lon").values.astype("float64")
-        displacement_labels[variable] = label
+        var = dataset[var_name]
+        if "date" not in var.dims:
+            continue
+        arr = var.transpose("date", "lat", "lon").values
+        pixel_series[key] = arr.astype("float64") if arr.dtype.kind == "f" else arr.astype("int32")
 
     mask_rows, mask_cols = np.where(spatial_mask)
-    pixel_lats = latitudes[mask_rows]
-    pixel_lons = longitudes[mask_cols]
-
+    center_lat = float(np.nanmean(latitudes[mask_rows]))
+    center_lon = float(np.nanmean(longitudes[mask_cols]))
     title = str(dataset.attrs.get("title") or dataset_path.stem)
+    pois = load_pois(project_paths, parameters)
+
     return ViewerData(
         dataset_path=dataset_path,
-        parameters_path=parameters_path,
         title=title,
         dates=dates,
         latitudes=latitudes,
@@ -420,61 +459,71 @@ def load_viewer_data(dataset_path: Path, parameters_path: Path) -> ViewerData:
         layer_ranges=layer_ranges,
         static_values=static_values,
         temporal_values=temporal_values,
-        displacement_labels=displacement_labels,
+        pixel_series=pixel_series,
+        pois=pois,
+        metadata=metadata,
+        parameters=parameters,
         aoi_lons=aoi_lons,
         aoi_lats=aoi_lats,
-        center_lat=float(np.nanmean(pixel_lats)),
-        center_lon=float(np.nanmean(pixel_lons)),
+        center_lat=center_lat,
+        center_lon=center_lon,
     )
 
 
+# ── Runtime accessors ──────────────────────────────────────────────────────────
+
 def require_viewer_data() -> ViewerData:
     if VIEWER_DATA is None:
-        raise RuntimeError("Viewer data has not been loaded.")
+        raise RuntimeError("Viewer data not loaded.")
     return VIEWER_DATA
 
 
 def spec_by_key(key: str) -> DataLayerSpec:
-    data = require_viewer_data()
-    for spec in data.layer_specs:
+    for spec in require_viewer_data().layer_specs:
         if spec.key == key:
             return spec
     raise KeyError(key)
 
 
-def clamp_date_index(date_index: int | None) -> int:
+def clamp_date_index(idx: int | None) -> int:
     data = require_viewer_data()
-    if not len(data.dates):
+    n = len(data.dates)
+    if not n:
         return 0
-    if date_index is None:
-        return len(data.dates) - 1
-    return max(0, min(len(data.dates) - 1, int(date_index)))
+    if idx is None:
+        return n - 1
+    return max(0, min(n - 1, int(idx)))
 
 
-def values_for_layer(key: str, date_index: int | None = None) -> np.ndarray:
-    data = require_viewer_data()
-    spec = spec_by_key(key)
-    if spec.temporal:
-        return data.temporal_values[key][clamp_date_index(date_index)]
-    return data.static_values[key]
+def finite_or_none(v: float) -> float | None:
+    try:
+        f = float(v)
+        return f if math.isfinite(f) else None
+    except (ValueError, TypeError):
+        return None
 
 
-def format_number(value: float) -> str:
-    if abs(value) >= 100:
-        return f"{value:.0f}"
-    if abs(value) >= 10:
-        return f"{value:.1f}"
-    return f"{value:.2f}"
+def format_number(v: float) -> str:
+    if abs(v) >= 100:
+        return f"{v:.0f}"
+    if abs(v) >= 10:
+        return f"{v:.1f}"
+    return f"{v:.2f}"
 
 
-def finite_or_none(value: float) -> float | None:
-    return float(value) if math.isfinite(float(value)) else None
+# ── Overlay rendering ──────────────────────────────────────────────────────────
 
-
-def rgba_to_uint8(colors: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+def _rgba_to_uint8(colors: np.ndarray, alpha: np.ndarray) -> np.ndarray:
     rgba = np.clip(colors * 255, 0, 255).astype("uint8")
     rgba[..., 3] = np.clip(alpha * 255, 0, 255).astype("uint8")
     return rgba
+
+
+def _png_bytes(rgba: np.ndarray) -> bytes:
+    image = Image.fromarray(np.flipud(rgba), mode="RGBA")
+    buf = io.BytesIO()
+    image.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
 
 
 @lru_cache(maxsize=128)
@@ -482,188 +531,236 @@ def overlay_png_bytes(key: str, date_index: int) -> bytes:
     data = require_viewer_data()
     spec = spec_by_key(key)
     if spec.kind == "aoi":
-        raise ValueError("AOI is rendered as vector geometry, not an image overlay.")
+        raise ValueError("AOI is a vector layer, not an image overlay.")
 
-    values = values_for_layer(key, date_index)
-    visible = data.spatial_mask.copy()
+    values = (
+        data.temporal_values[key][clamp_date_index(date_index)]
+        if spec.temporal
+        else data.static_values[key]
+    )
 
     if spec.kind == "mask":
-        mask_values = np.where(np.isfinite(values), values > 0.5, False)
+        mask_vals = np.where(np.isfinite(values), values > 0.5, False)
         rgba = np.zeros(values.shape + (4,), dtype="uint8")
-        rgba[data.spatial_mask & ~mask_values] = np.array([154, 167, 173, 185], dtype="uint8")
-        rgba[data.spatial_mask & mask_values] = np.array([33, 166, 122, 225], dtype="uint8")
+        rgba[data.spatial_mask & ~mask_vals] = [154, 167, 173, 185]
+        rgba[data.spatial_mask & mask_vals] = [33, 166, 122, 225]
     else:
-        visible &= np.isfinite(values)
+        visible = data.spatial_mask & np.isfinite(values)
         low, high = data.layer_ranges[key]
-        if spec.symmetric:
-            norm = TwoSlopeNorm(vmin=low, vcenter=0.0, vmax=high)
-        else:
-            norm = Normalize(vmin=low, vmax=high)
-
+        norm = (
+            TwoSlopeNorm(vmin=low, vcenter=0.0, vmax=high)
+            if spec.symmetric
+            else Normalize(vmin=low, vmax=high)
+        )
         cmap = colormaps.get_cmap(spec.colormap)
         normalized = np.zeros(values.shape, dtype="float64")
         normalized[visible] = norm(values[visible])
         colors = cmap(normalized)
         alpha = np.where(visible, 1.0, 0.0)
-        rgba = rgba_to_uint8(colors, alpha)
+        rgba = _rgba_to_uint8(colors, alpha)
 
-    image = Image.fromarray(np.flipud(rgba), mode="RGBA")
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG", optimize=True)
-    return buffer.getvalue()
+    return _png_bytes(rgba)
 
 
-def build_legend(spec: DataLayerSpec) -> dict | None:
-    if spec.kind == "aoi":
+@lru_cache(maxsize=64)
+def coh_filtered_velocity_png_bytes(threshold_pct: int) -> bytes:
+    """Render sbas_velocity_raw, masking out pixels where coherence_median < threshold."""
+    data = require_viewer_data()
+    velocity = data.static_values.get("sbas_velocity_raw")
+    coherence = data.static_values.get("coherence_median")
+    if velocity is None or coherence is None:
+        raise ValueError("sbas_velocity_raw or coherence_median not available.")
+
+    threshold = threshold_pct / 100.0
+    visible = data.spatial_mask & np.isfinite(velocity) & (coherence >= threshold)
+
+    low, high = data.layer_ranges.get(
+        "sbas_velocity_raw",
+        data.layer_ranges.get("sbas_velocity_masked", (-10.0, 10.0)),
+    )
+    norm = TwoSlopeNorm(vmin=low, vcenter=0.0, vmax=high)
+    cmap = colormaps.get_cmap("RdBu_r")
+
+    normalized = np.zeros(velocity.shape, dtype="float64")
+    normalized[visible] = norm(velocity[visible])
+    colors = cmap(normalized)
+    alpha = np.where(visible, 1.0, 0.0)
+    return _png_bytes(_rgba_to_uint8(colors, alpha))
+
+
+def _build_legend(spec: DataLayerSpec) -> dict | None:
+    if spec.kind in ("aoi", "mask"):
         return None
-
     data = require_viewer_data()
     low, high = data.layer_ranges.get(spec.key, (0.0, 1.0))
-    if spec.kind == "mask":
-        return {
-            "low": "invalid",
-            "high": "valid",
-            "colors": ["#9aa7ad", "#21a67a"],
-        }
-
-    if spec.colormap == "viridis":
-        colors = ["#440154", "#31688e", "#35b779", "#fde725"]
-    else:
-        colors = ["#08306b", "#f7f7f7", "#67000d"]
-
-    return {
-        "low": format_number(low),
-        "high": format_number(high),
-        "colors": colors,
+    cmap_colors = {
+        "viridis": ["#440154", "#31688e", "#35b779", "#fde725"],
+        "terrain": ["#333399", "#006600", "#c8a450", "#ffffff"],
     }
+    colors = cmap_colors.get(spec.colormap, ["#08306b", "#f7f7f7", "#67000d"])
+    return {"low": format_number(low), "high": format_number(high), "colors": colors}
 
+
+# ── API payload builders ───────────────────────────────────────────────────────
 
 def build_viewer_payload() -> dict:
     data = require_viewer_data()
-    default_date_index = clamp_date_index(None)
-
+    vel_range = data.layer_ranges.get(
+        "sbas_velocity_raw",
+        data.layer_ranges.get("sbas_velocity_masked", (-10.0, 10.0)),
+    )
     return {
         "title": data.title,
-        "dataset": str(data.dataset_path),
+        "dataset": data.dataset_path.name,
         "center": [data.center_lat, data.center_lon],
         "bounds": [
             [float(data.lat_edges[0]), float(data.lon_edges[0])],
             [float(data.lat_edges[-1]), float(data.lon_edges[-1])],
         ],
         "defaultZoom": DEFAULT_ZOOM,
-        "dates": [date.strftime("%Y-%m-%d") for date in data.dates],
-        "defaultDateIndex": default_date_index,
+        "dates": [d.strftime("%Y-%m-%d") for d in data.dates],
+        "defaultDateIndex": clamp_date_index(None),
+        "cohThresholdDefault": DEFAULT_COH_THRESHOLD,
+        "cohSliderStep": COH_SLIDER_STEP,
+        "velocityRange": list(vel_range),
         "baseLayers": [
             {
-                "key": spec.key,
-                "label": spec.label,
-                "url": spec.url,
-                "attribution": spec.attribution,
-                "defaultEnabled": spec.default_enabled,
-                "defaultOpacity": spec.default_opacity,
-                "maxZoom": spec.max_zoom,
+                "key": s.key, "label": s.label, "url": s.url,
+                "attribution": s.attribution,
+                "defaultEnabled": s.default_enabled,
+                "defaultOpacity": s.default_opacity,
+                "maxZoom": s.max_zoom,
             }
-            for spec in BASEMAP_SPECS
+            for s in BASEMAP_SPECS
         ],
         "dataLayers": [
             {
-                "key": spec.key,
-                "label": spec.label,
-                "kind": spec.kind,
-                "units": spec.units,
-                "defaultEnabled": spec.default_enabled,
-                "defaultOpacity": spec.default_opacity,
-                "temporal": spec.temporal,
-                "legend": build_legend(spec),
+                "key": s.key, "label": s.label, "kind": s.kind,
+                "units": s.units, "temporal": s.temporal,
+                "defaultEnabled": s.default_enabled,
+                "defaultOpacity": s.default_opacity,
+                "legend": _build_legend(s),
             }
-            for spec in data.layer_specs
+            for s in data.layer_specs
         ],
         "aoi": (
             [[float(lat), float(lon)] for lon, lat in zip(data.aoi_lons, data.aoi_lats)]
-            if data.aoi_lons is not None and data.aoi_lats is not None
-            else None
+            if data.aoi_lons is not None else None
         ),
-        "seriesColors": SERIES_COLORS,
+        "pois": list(data.pois),
+        "segmentColors": SEGMENT_COLORS,
+    }
+
+
+def coherence_grid_payload() -> dict:
+    data = require_viewer_data()
+    coh = data.static_values.get("coherence_median")
+    if coh is None:
+        return {"available": False}
+    flat = coh.ravel()
+    mask_flat = data.spatial_mask.ravel()
+    return {
+        "available": True,
+        "shape": list(coh.shape),
+        "values": [round(float(v), 4) if math.isfinite(float(v)) else None for v in flat],
+        "valid_mask": [int(v) for v in mask_flat],
+        "total_valid": int(np.sum(mask_flat)),
     }
 
 
 def cell_index_from_latlon(lat: float, lon: float) -> tuple[int, int] | None:
     data = require_viewer_data()
-    if lat < data.lat_edges[0] or lat > data.lat_edges[-1]:
+    if not (data.lat_edges[0] <= lat <= data.lat_edges[-1]):
         return None
-    if lon < data.lon_edges[0] or lon > data.lon_edges[-1]:
+    if not (data.lon_edges[0] <= lon <= data.lon_edges[-1]):
         return None
-
     row = int(np.searchsorted(data.lat_edges, lat, side="right") - 1)
     col = int(np.searchsorted(data.lon_edges, lon, side="right") - 1)
-    if row < 0 or row >= len(data.latitudes) or col < 0 or col >= len(data.longitudes):
+    if not (0 <= row < len(data.latitudes) and 0 <= col < len(data.longitudes)):
         return None
     return row, col
 
 
-def pixel_metrics(row: int, col: int, date_index: int) -> list[dict]:
-    metrics = []
-    for spec in require_viewer_data().layer_specs:
-        if spec.kind == "aoi":
-            continue
-        value = values_for_layer(spec.key, date_index)[row, col]
-        metrics.append(
-            {
-                "label": spec.label,
-                "value": finite_or_none(value),
-                "units": spec.units,
-            }
-        )
-    return metrics
-
-
-def pixel_time_series(row: int, col: int) -> list[dict]:
-    data = require_viewer_data()
-    series = []
-    for variable, label in data.displacement_labels.items():
-        values = data.temporal_values[variable][:, row, col]
-        if not np.isfinite(values).any():
-            continue
-        series.append(
-            {
-                "key": variable,
-                "label": label,
-                "color": SERIES_COLORS.get(variable, "#126a65"),
-                "values": [finite_or_none(value) for value in values],
-            }
-        )
-    return series
-
-
-def pixel_payload(lat: float, lon: float, date_index: int) -> dict:
+def pixel_payload(lat: float, lon: float) -> dict:
     data = require_viewer_data()
     index = cell_index_from_latlon(lat, lon)
     if index is None:
         return {"found": False, "reason": "outside grid"}
-
     row, col = index
     if not data.spatial_mask[row, col]:
         return {"found": False, "reason": "outside AOI"}
 
-    series = pixel_time_series(row, col)
-    if not series:
-        return {"found": False, "reason": "no finite displacement series"}
+    ps = data.pixel_series
+    raw_arr = ps.get("raw")
+    if raw_arr is None:
+        return {"found": False, "reason": "no displacement data"}
+
+    raw_vals = [finite_or_none(v) for v in raw_arr[:, row, col]]
+    if not any(v is not None for v in raw_vals):
+        return {"found": False, "reason": "no finite displacement values"}
+
+    n = len(data.dates)
+
+    seg_arr = ps.get("segmented")
+    seg_id_arr = ps.get("segment_id")
+    vtm_arr = ps.get("valid_time_mask")
+    cpd_arr = ps.get("coh_per_date")
+
+    segmented_vals = [finite_or_none(v) for v in (seg_arr[:, row, col] if seg_arr is not None else [float("nan")] * n)]
+    seg_ids = [int(v) for v in (seg_id_arr[:, row, col] if seg_id_arr is not None else [0] * n)]
+    valid_mask = [int(v) for v in (vtm_arr[:, row, col] if vtm_arr is not None else [0] * n)]
+    coh_per_date = [finite_or_none(v) for v in (cpd_arr[:, row, col] if cpd_arr is not None else [float("nan")] * n)]
+
+    unique_segs = sorted({s for s in seg_ids if s > 0})
+    seg_count = len(unique_segs)
+    valid_count = sum(1 for m in valid_mask if m > 0)
+
+    vel_arr = data.static_values.get("sbas_velocity_masked")
+    velocity_val = finite_or_none(vel_arr[row, col]) if vel_arr is not None else None
+
+    coh_arr = data.static_values.get("coherence_median")
+    coh_val = finite_or_none(coh_arr[row, col]) if coh_arr is not None else None
+
+    mask_arr = data.static_values.get("valid_pixel_mask")
+    below_static_mask = bool(mask_arr is not None and mask_arr[row, col] < 0.5)
 
     return {
         "found": True,
-        "row": row,
-        "col": col,
         "lat": float(data.latitudes[row]),
         "lon": float(data.longitudes[col]),
         "cellBounds": [
             [float(data.lat_edges[row]), float(data.lon_edges[col])],
             [float(data.lat_edges[row + 1]), float(data.lon_edges[col + 1])],
         ],
-        "dates": [date.strftime("%Y-%m-%d") for date in data.dates],
-        "metrics": pixel_metrics(row, col, date_index),
-        "series": series,
+        "dates": [d.strftime("%Y-%m-%d") for d in data.dates],
+        "velocity_mm_yr": velocity_val,
+        "coherence_median": coh_val,
+        "valid_epoch_count": valid_count,
+        "total_epoch_count": n,
+        "segment_count": seg_count,
+        "has_gap": seg_count > 1,
+        "below_static_mask": below_static_mask,
+        "series": {
+            "raw": raw_vals,
+            "segmented": segmented_vals,
+            "segment_id": seg_ids,
+            "valid_time_mask": valid_mask,
+            "coh_per_date": coh_per_date,
+        },
     }
 
+
+def metadata_payload() -> dict:
+    data = require_viewer_data()
+    return {
+        "metadata": data.metadata,
+        "parameters": data.parameters,
+        "dataset": data.dataset_path.name,
+        "pois": list(data.pois),
+    }
+
+
+# ── Flask app ──────────────────────────────────────────────────────────────────
 
 def create_app() -> Flask:
     app = Flask(__name__)
@@ -680,21 +777,33 @@ def create_app() -> Flask:
     def pixel_api():
         lat = float(request.args["lat"])
         lon = float(request.args["lon"])
-        date_index = clamp_date_index(int(request.args.get("date", clamp_date_index(None))))
-        return jsonify(pixel_payload(lat, lon, date_index))
+        return jsonify(pixel_payload(lat, lon))
+
+    @app.get("/api/coherence_grid")
+    def coherence_grid_api():
+        return jsonify(coherence_grid_payload())
+
+    @app.get("/api/metadata")
+    def metadata_api():
+        return jsonify(metadata_payload())
 
     @app.get("/overlay/<key>/<int:date_index>.png")
     def overlay_api(key: str, date_index: int) -> Response:
-        date_index = clamp_date_index(date_index)
-        content = overlay_png_bytes(key, date_index)
-        return Response(
-            content,
-            mimetype="image/png",
-            headers={"Cache-Control": "public, max-age=3600"},
-        )
+        content = overlay_png_bytes(key, clamp_date_index(date_index))
+        return Response(content, mimetype="image/png",
+                        headers={"Cache-Control": "public, max-age=3600"})
+
+    @app.get("/overlay/velocity_coh_filtered/<int:threshold_pct>.png")
+    def coh_filtered_overlay_api(threshold_pct: int) -> Response:
+        pct = max(10, min(90, threshold_pct))
+        content = coh_filtered_velocity_png_bytes(pct)
+        return Response(content, mimetype="image/png",
+                        headers={"Cache-Control": "public, max-age=3600"})
 
     return app
 
+
+# ── Embedded HTML/CSS/JS ───────────────────────────────────────────────────────
 
 APP_HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -704,809 +813,1016 @@ APP_HTML = r"""<!DOCTYPE html>
   <title>InSAR SBAS Viewer</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css" />
   <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>
-  <script src="https://unpkg.com/lucide@latest"></script>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
   <style>
-    * { box-sizing: border-box; }
-    html, body, #map {
-      height: 100%;
-      width: 100%;
-      margin: 0;
-      padding: 0;
-      font-family: "Segoe UI", Arial, sans-serif;
-      color: #172126;
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --top-h: 48px;
+      --bottom-h: 56px;
+      --left-w: 224px;
+      --right-w: 296px;
+      --bg: #0b1825;
+      --panel: #0f2033;
+      --panel2: #162840;
+      --border: rgba(255,255,255,0.07);
+      --border2: rgba(255,255,255,0.12);
+      --text: #cce0f0;
+      --text2: #6a91ae;
+      --accent: #29b6f6;
+      --accent2: #00c896;
+      --danger: #ef5350;
+      --warn: #ffb74d;
+      --radius: 8px;
+      --tr: 0.18s ease;
     }
+
+    html, body { height: 100%; overflow: hidden; font-family: "Inter","Segoe UI",system-ui,sans-serif; background: var(--bg); color: var(--text); font-size: 13px; }
+
+    /* ── Top bar ── */
+    #top-bar {
+      position: fixed; top: 0; left: 0; right: 0; height: var(--top-h); z-index: 1000;
+      display: flex; align-items: center; gap: 10px; padding: 0 14px;
+      background: rgba(11,24,37,0.97); border-bottom: 1px solid var(--border2);
+      backdrop-filter: blur(10px);
+    }
+    #sidebar-toggle {
+      display: grid; place-items: center; width: 32px; height: 32px;
+      border: 1px solid var(--border2); border-radius: 6px; background: transparent;
+      color: var(--text2); cursor: pointer; font-size: 16px; flex-shrink: 0;
+      transition: color var(--tr), background var(--tr);
+    }
+    #sidebar-toggle:hover { color: var(--accent); background: rgba(41,182,246,0.08); }
+    #top-title { font-size: 15px; font-weight: 700; color: var(--text); letter-spacing: -0.2px; }
+    #top-meta { font-size: 11px; color: var(--text2); }
+    .top-spacer { flex: 1; }
+    #about-btn {
+      display: flex; align-items: center; gap: 6px; height: 32px; padding: 0 12px;
+      border: 1px solid var(--border2); border-radius: 6px; background: transparent;
+      color: var(--text2); cursor: pointer; font: inherit; font-size: 12px;
+      transition: color var(--tr), border-color var(--tr), background var(--tr);
+    }
+    #about-btn:hover { color: var(--accent); border-color: var(--accent); background: rgba(41,182,246,0.06); }
+
+    /* ── Map ── */
     #map {
-      background: #dfe6e8;
+      position: fixed; top: var(--top-h); bottom: var(--bottom-h);
+      left: var(--left-w); right: var(--right-w); background: #0d1a27;
+      transition: left var(--tr), right var(--tr);
     }
-    .leaflet-image-layer {
-      image-rendering: pixelated;
-      image-rendering: crisp-edges;
-      pointer-events: none;
+    .leaflet-image-layer { image-rendering: pixelated; image-rendering: crisp-edges; pointer-events: none; }
+    .leaflet-control-attribution { font-size: 9px; background: rgba(11,24,37,0.75) !important; color: #8ca8be !important; }
+    .leaflet-control-attribution a { color: var(--accent) !important; }
+    .leaflet-control-scale-line { background: rgba(11,24,37,0.75); border-color: var(--border2); color: var(--text2); }
+
+    /* ── POI sidebar ── */
+    #poi-sidebar {
+      position: fixed; top: var(--top-h); left: 0; bottom: var(--bottom-h);
+      width: var(--left-w); z-index: 900;
+      background: var(--panel); border-right: 1px solid var(--border2);
+      display: flex; flex-direction: column; overflow: hidden;
+      transition: transform var(--tr);
     }
-    .leaflet-data-pane,
-    .leaflet-aoi-pane,
-    .leaflet-selection-pane {
-      pointer-events: none;
+    #poi-sidebar.collapsed { transform: translateX(calc(-1 * var(--left-w))); }
+    .sidebar-head {
+      padding: 11px 12px; border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: space-between; flex-shrink: 0;
     }
-    .leaflet-control-attribution {
-      font-size: 10px;
+    .sidebar-head-label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px; color: var(--text2); }
+    #poi-count { font-size: 11px; color: var(--accent); font-weight: 600; }
+    #poi-list { flex: 1; overflow-y: auto; }
+    #poi-list::-webkit-scrollbar { width: 4px; }
+    #poi-list::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+    .poi-item {
+      display: flex; align-items: center; gap: 9px; padding: 9px 12px;
+      cursor: pointer; border-bottom: 1px solid var(--border);
+      transition: background var(--tr);
     }
-    .floating-control {
-      position: fixed;
-      top: 14px;
-      right: 14px;
-      z-index: 1000;
-      width: min(340px, calc(100vw - 28px));
-      max-height: calc(100vh - 28px);
-      overflow: auto;
-      border: 1px solid rgba(23, 33, 38, 0.18);
-      border-radius: 8px;
-      background: rgba(255, 255, 255, 0.94);
-      box-shadow: 0 12px 34px rgba(10, 18, 22, 0.18);
-      backdrop-filter: blur(8px);
+    .poi-item:hover { background: rgba(41,182,246,0.07); }
+    .poi-item.active { background: rgba(41,182,246,0.13); }
+    .poi-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; background: var(--accent2); border: 1.5px solid rgba(0,200,150,0.4); }
+    .poi-name { font-size: 12px; font-weight: 600; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .poi-coords { font-size: 10px; color: var(--text2); margin-top: 1px; font-variant-numeric: tabular-nums; }
+
+    /* ── Layer panel ── */
+    #layer-panel {
+      position: fixed; top: var(--top-h); right: 0; bottom: var(--bottom-h);
+      width: var(--right-w); z-index: 900;
+      background: var(--panel); border-left: 1px solid var(--border2);
+      display: flex; flex-direction: column; overflow: hidden;
     }
-    .control-header {
-      padding: 12px 13px 10px;
-      border-bottom: 1px solid #dfe7ea;
+    .panel-head {
+      padding: 11px 12px; border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: space-between; flex-shrink: 0;
     }
-    .control-title {
-      margin: 0;
-      font-size: 16px;
-      font-weight: 750;
-      letter-spacing: 0;
+    .panel-head-label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px; color: var(--text2); }
+    #layer-panel-scroll { flex: 1; overflow-y: auto; }
+    #layer-panel-scroll::-webkit-scrollbar { width: 4px; }
+    #layer-panel-scroll::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+    .layer-section { border-bottom: 1px solid var(--border); }
+    .layer-section-title {
+      padding: 8px 12px; font-size: 10px; font-weight: 700; text-transform: uppercase;
+      letter-spacing: 0.6px; color: var(--text2); cursor: pointer; user-select: none;
+      display: flex; align-items: center; justify-content: space-between;
     }
-    .control-subtitle {
-      margin-top: 2px;
-      color: #607078;
-      font-size: 12px;
-      overflow-wrap: anywhere;
-    }
-    .layer-section {
-      border-bottom: 1px solid #dfe7ea;
-    }
-    .layer-section summary {
-      cursor: pointer;
-      padding: 10px 13px;
-      color: #1f2b31;
-      font-size: 12px;
-      font-weight: 750;
-      text-transform: uppercase;
-      user-select: none;
-    }
+    .layer-section-title:hover { color: var(--text); }
+    .layer-section-title .chev { font-size: 10px; transition: transform var(--tr); }
+    .layer-section-title.collapsed .chev { transform: rotate(-90deg); }
     .layer-row {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) 32px;
-      gap: 8px;
-      align-items: center;
-      min-height: 42px;
-      padding: 7px 10px 7px 13px;
-      border-top: 1px solid #e7eef1;
-      background: rgba(255, 255, 255, 0.78);
+      display: flex; align-items: center; gap: 8px; padding: 7px 12px;
+      border-top: 1px solid var(--border); transition: background var(--tr);
     }
-    .layer-check {
-      display: flex;
-      align-items: center;
-      min-width: 0;
-      gap: 8px;
-      font-size: 13px;
-      font-weight: 600;
-      line-height: 1.25;
+    .layer-row:hover { background: var(--panel2); }
+    .layer-check { display: flex; align-items: center; gap: 7px; flex: 1; min-width: 0; cursor: pointer; }
+    .layer-check input[type=checkbox] { accent-color: var(--accent); width: 13px; height: 13px; flex-shrink: 0; cursor: pointer; }
+    .layer-label { font-size: 12px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .op-btn {
+      flex-shrink: 0; display: grid; place-items: center; width: 24px; height: 24px;
+      border: 1px solid transparent; border-radius: 5px; background: transparent;
+      color: var(--text2); cursor: pointer; font-size: 12px;
+      transition: color var(--tr), border-color var(--tr);
     }
-    .layer-check input {
-      flex: 0 0 auto;
-      width: 14px;
-      height: 14px;
-      accent-color: #126a65;
+    .op-btn:hover { color: var(--accent); border-color: var(--border2); }
+    .op-wrap { padding: 4px 12px 8px; display: none; }
+    .op-wrap.open { display: block; }
+    .op-wrap input[type=range] { width: 100%; accent-color: var(--accent); }
+    .op-wrap select {
+      width: 100%; margin-top: 5px; background: var(--panel2); color: var(--text);
+      border: 1px solid var(--border2); border-radius: 4px; padding: 3px; font: inherit; font-size: 11px;
     }
-    .layer-check span {
-      min-width: 0;
-      overflow-wrap: anywhere;
+
+    /* ── Coherence filter ── */
+    #coh-filter-section { border-top: 1px solid var(--border2); padding: 12px; flex-shrink: 0; }
+    .coh-title { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px; color: var(--text2); margin-bottom: 10px; }
+    .coh-toggle-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+    .coh-toggle-label { font-size: 12px; color: var(--text); }
+    .toggle-sw { position: relative; display: inline-block; width: 34px; height: 18px; }
+    .toggle-sw input { opacity: 0; width: 0; height: 0; }
+    .toggle-track {
+      position: absolute; cursor: pointer; inset: 0;
+      background: var(--panel2); border: 1px solid var(--border2); border-radius: 18px;
+      transition: background var(--tr);
     }
-    .icon-button {
-      display: inline-grid;
-      place-items: center;
-      width: 28px;
-      height: 28px;
-      border: 1px solid transparent;
-      border-radius: 6px;
-      background: transparent;
-      color: #42525a;
-      cursor: pointer;
+    .toggle-track::after {
+      content: ""; position: absolute; left: 2px; top: 2px;
+      width: 12px; height: 12px; border-radius: 50%;
+      background: var(--text2); transition: left var(--tr), background var(--tr);
     }
-    .icon-button:hover {
-      border-color: #bfd0d6;
-      background: #f1f6f7;
-      color: #126a65;
-    }
-    .icon-button svg {
-      width: 16px;
-      height: 16px;
-      stroke-width: 2.2;
-    }
-    .settings-panel,
-    .time-panel {
-      position: fixed;
-      z-index: 1001;
-      border: 1px solid rgba(23, 33, 38, 0.2);
-      border-radius: 8px;
-      background: rgba(255, 255, 255, 0.96);
-      box-shadow: 0 16px 42px rgba(10, 18, 22, 0.2);
-      backdrop-filter: blur(8px);
-    }
-    .settings-panel {
-      top: 78px;
-      right: 370px;
-      width: min(310px, calc(100vw - 28px));
-      padding: 13px;
-    }
-    .time-panel {
-      right: 14px;
-      bottom: 24px;
-      width: min(390px, calc(100vw - 28px));
-      max-height: calc(100vh - 120px);
-      overflow: auto;
-    }
-    .panel-hidden {
-      display: none;
-    }
-    .panel-header {
-      display: flex;
-      justify-content: space-between;
-      gap: 10px;
-      align-items: start;
-      padding-bottom: 8px;
-      border-bottom: 1px solid #e1e9ec;
-    }
-    .panel-title {
-      margin: 0;
-      font-size: 15px;
-      font-weight: 750;
-      line-height: 1.25;
-    }
-    .panel-body {
-      padding-top: 12px;
-    }
-    .setting-group {
-      margin-bottom: 12px;
-    }
-    .setting-label {
-      display: flex;
-      justify-content: space-between;
-      gap: 8px;
-      margin-bottom: 7px;
-      color: #435058;
-      font-size: 12px;
-      font-weight: 700;
-      text-transform: uppercase;
-    }
-    .setting-slider {
-      width: 100%;
-      accent-color: #126a65;
-    }
-    .setting-select {
-      width: 100%;
-      height: 34px;
-      border: 1px solid #bdcbd0;
-      border-radius: 6px;
-      background: #ffffff;
-      color: #172126;
-      font: inherit;
-      font-size: 13px;
-    }
-    .legend-stack {
-      position: fixed;
-      left: 14px;
-      bottom: 30px;
-      z-index: 999;
-      display: grid;
-      gap: 8px;
-      width: min(280px, calc(100vw - 28px));
-      pointer-events: none;
+    .toggle-sw input:checked + .toggle-track { background: rgba(41,182,246,0.2); border-color: var(--accent); }
+    .toggle-sw input:checked + .toggle-track::after { left: 16px; background: var(--accent); }
+    .coh-slider-labels { display: flex; justify-content: space-between; font-size: 10px; color: var(--text2); margin-bottom: 4px; }
+    #coh-slider { width: 100%; accent-color: var(--accent); margin-bottom: 8px; }
+    #coh-threshold-display { font-size: 22px; font-weight: 700; color: var(--accent); text-align: center; line-height: 1; margin-bottom: 4px; }
+    #coh-pixel-count { font-size: 11px; color: var(--text2); text-align: center; min-height: 14px; }
+
+    /* ── Legend stack ── */
+    #legend-stack {
+      position: fixed; left: calc(var(--left-w) + 10px); bottom: calc(var(--bottom-h) + 10px);
+      z-index: 800; display: flex; flex-direction: column; gap: 6px; pointer-events: none;
+      transition: left var(--tr);
     }
     .legend-card {
-      padding: 9px 10px;
-      border: 1px solid rgba(23, 33, 38, 0.17);
-      border-radius: 7px;
-      background: rgba(255, 255, 255, 0.9);
-      box-shadow: 0 8px 24px rgba(10, 18, 22, 0.13);
+      padding: 8px 10px; border: 1px solid var(--border2); border-radius: var(--radius);
+      background: rgba(15,32,51,0.94); backdrop-filter: blur(8px);
+      box-shadow: 0 4px 20px rgba(0,0,0,0.4);
     }
-    .legend-title {
-      font-size: 12px;
-      font-weight: 750;
-      line-height: 1.25;
+    .legend-title { font-size: 11px; font-weight: 700; color: var(--text); margin-bottom: 1px; }
+    .legend-date { font-size: 10px; color: var(--text2); margin-bottom: 5px; }
+    .legend-scale { display: grid; grid-template-columns: auto 1fr auto; gap: 6px; align-items: center; font-size: 10px; color: var(--text2); }
+    .legend-gradient { height: 10px; border-radius: 2px; border: 1px solid rgba(255,255,255,0.1); }
+
+    /* ── Bottom bar ── */
+    #bottom-bar {
+      position: fixed; bottom: 0; left: 0; right: 0; height: var(--bottom-h); z-index: 1000;
+      background: rgba(11,24,37,0.97); border-top: 1px solid var(--border2);
+      display: flex; align-items: center; padding: 0 16px; gap: 12px;
+      backdrop-filter: blur(10px);
     }
-    .legend-date {
-      margin-top: 1px;
-      color: #607078;
-      font-size: 11px;
+    #velocity-btn {
+      flex-shrink: 0; height: 28px; padding: 0 12px; border-radius: 6px;
+      border: 1px solid var(--border2); background: transparent;
+      color: var(--text2); cursor: pointer; font: inherit; font-size: 11px; font-weight: 600;
+      transition: all var(--tr);
     }
-    .legend-scale {
-      display: grid;
-      grid-template-columns: auto minmax(70px, 1fr) auto;
-      gap: 7px;
-      align-items: center;
-      margin-top: 6px;
-      color: #435058;
-      font-size: 11px;
+    #velocity-btn.active { border-color: var(--accent2); color: var(--accent2); background: rgba(0,200,150,0.08); }
+    #velocity-btn:not(.active):hover { border-color: var(--text2); color: var(--text); }
+    .date-edge { font-size: 10px; color: var(--text2); flex-shrink: 0; font-variant-numeric: tabular-nums; }
+    #date-slider-track { flex: 1; }
+    #date-slider { width: 100%; accent-color: var(--accent); }
+    #current-date-label { flex-shrink: 0; font-size: 11px; font-weight: 700; color: var(--accent); min-width: 82px; text-align: right; font-variant-numeric: tabular-nums; }
+
+    /* ── Time series panel ── */
+    #time-panel {
+      position: fixed; top: var(--top-h); right: var(--right-w); bottom: var(--bottom-h);
+      width: 460px; z-index: 950;
+      background: rgba(10,22,34,0.99); border-left: 1px solid var(--border2);
+      display: flex; flex-direction: column; overflow: hidden;
+      backdrop-filter: blur(14px);
+      transform: translateX(110%); transition: transform 0.22s ease;
     }
-    .legend-gradient {
-      height: 12px;
-      border: 1px solid rgba(23, 33, 38, 0.18);
-      border-radius: 2px;
+    #time-panel.open { transform: translateX(0); }
+    #time-panel-head {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 11px 14px; border-bottom: 1px solid var(--border); flex-shrink: 0;
     }
-    .time-panel .panel-header {
-      padding: 12px 12px 8px;
+    #time-panel-head h2 { font-size: 13px; font-weight: 700; }
+    #close-time-panel {
+      display: grid; place-items: center; width: 28px; height: 28px;
+      border: 1px solid var(--border2); border-radius: 6px; background: transparent;
+      color: var(--text2); cursor: pointer; font-size: 18px; line-height: 1;
+      transition: color var(--tr), border-color var(--tr);
     }
-    .time-panel .panel-body {
-      padding: 10px 12px 12px;
+    #close-time-panel:hover { color: var(--danger); border-color: var(--danger); }
+    #pixel-summary { padding: 10px 14px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+    .sum-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 8px; }
+    .sum-card { padding: 7px 9px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel2); }
+    .sum-label { font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text2); }
+    .sum-value { font-size: 13px; font-weight: 700; color: var(--text); margin-top: 2px; font-variant-numeric: tabular-nums; }
+    .sum-value.danger { color: var(--danger); }
+    .sum-value.warn { color: var(--warn); }
+    .sum-value.ok { color: var(--accent2); }
+    .gap-warn {
+      display: flex; align-items: flex-start; gap: 7px; padding: 7px 9px;
+      border: 1px solid rgba(255,183,77,0.3); border-radius: 6px;
+      background: rgba(255,183,77,0.06); font-size: 11px; color: var(--warn); line-height: 1.4;
     }
-    .pixel-meta {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 7px;
-      margin-bottom: 8px;
+    #ts-chart-wrap { flex: 1; overflow: hidden; padding: 4px 2px 2px; min-height: 0; }
+    #ts-chart { width: 100%; height: 100%; }
+
+    /* ── About modal ── */
+    #about-backdrop {
+      position: fixed; inset: 0; z-index: 1100;
+      background: rgba(0,0,0,0.6); backdrop-filter: blur(4px); display: none;
     }
-    .metric {
-      border: 1px solid #dce5e9;
-      border-radius: 6px;
-      background: #fbfcfc;
-      padding: 7px 8px;
+    #about-backdrop.open { display: block; }
+    #about-modal {
+      position: fixed; top: 50%; left: 50%; z-index: 1101;
+      transform: translate(-50%, -50%);
+      width: min(640px, calc(100vw - 32px)); max-height: calc(100vh - 80px);
+      background: var(--panel); border: 1px solid var(--border2); border-radius: var(--radius);
+      box-shadow: 0 24px 80px rgba(0,0,0,0.7);
+      display: none; flex-direction: column;
     }
-    .metric-label {
-      color: #607078;
-      font-size: 10px;
-      font-weight: 750;
-      text-transform: uppercase;
-      line-height: 1.2;
+    #about-modal.open { display: flex; }
+    #about-modal-head {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 14px 16px; border-bottom: 1px solid var(--border); flex-shrink: 0;
     }
-    .metric-value {
-      margin-top: 3px;
-      color: #172126;
-      font-size: 13px;
-      font-weight: 720;
-      overflow-wrap: anywhere;
+    #about-modal-head h2 { font-size: 15px; font-weight: 700; }
+    #close-about {
+      display: grid; place-items: center; width: 28px; height: 28px;
+      border: 1px solid var(--border2); border-radius: 6px; background: transparent;
+      color: var(--text2); cursor: pointer; font-size: 18px;
+      transition: color var(--tr), border-color var(--tr);
     }
-    .chart-wrap {
-      width: 100%;
-      overflow: hidden;
+    #close-about:hover { color: var(--danger); border-color: var(--danger); }
+    #about-body { flex: 1; overflow-y: auto; padding: 16px; }
+    #about-body::-webkit-scrollbar { width: 4px; }
+    #about-body::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+    .a-section { margin-bottom: 18px; }
+    .a-section h3 { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.7px; color: var(--text2); margin-bottom: 8px; padding-bottom: 5px; border-bottom: 1px solid var(--border); }
+    .a-dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; }
+    .a-dt { font-size: 11px; color: var(--text2); white-space: nowrap; padding: 2px 0; }
+    .a-dd { font-size: 11px; color: var(--text); padding: 2px 0; word-break: break-word; }
+    .a-note { font-size: 11px; color: var(--text2); line-height: 1.5; padding: 6px 8px; background: var(--panel2); border-radius: 4px; border-left: 2px solid var(--border2); margin-bottom: 6px; }
+    .a-note.warn-note { border-left-color: var(--warn); color: var(--warn); }
+    .scene-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 7px; }
+    .scene-chip { font-size: 10px; padding: 2px 7px; background: var(--panel2); border: 1px solid var(--border); border-radius: 4px; color: var(--text2); font-variant-numeric: tabular-nums; }
+
+    /* ── Toast ── */
+    #toast {
+      position: fixed; left: 50%; bottom: calc(var(--bottom-h) + 14px);
+      transform: translateX(-50%); z-index: 2000;
+      padding: 8px 14px; border-radius: 6px;
+      background: rgba(15,32,51,0.96); border: 1px solid var(--border2);
+      color: var(--text); font-size: 12px; pointer-events: none;
+      box-shadow: 0 6px 24px rgba(0,0,0,0.5);
+      opacity: 0; transition: opacity 0.15s ease;
     }
-    .chart-wrap svg {
-      display: block;
-      width: 100%;
-      height: auto;
-    }
-    .chart-legend {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px 10px;
-      margin-top: 8px;
-      font-size: 11px;
-      color: #42525a;
-    }
-    .legend-dot {
-      display: inline-block;
-      width: 8px;
-      height: 8px;
-      margin-right: 4px;
-      border-radius: 50%;
-      vertical-align: middle;
-    }
-    .toast {
-      position: fixed;
-      left: 50%;
-      bottom: 18px;
-      transform: translateX(-50%);
-      z-index: 1002;
-      padding: 8px 11px;
-      border-radius: 6px;
-      background: rgba(23, 33, 38, 0.9);
-      color: #ffffff;
-      font-size: 12px;
-      pointer-events: none;
-    }
+    #toast.visible { opacity: 1; }
+    .spin { display: inline-block; width: 12px; height: 12px; border: 2px solid var(--border2); border-top-color: var(--accent); border-radius: 50%; animation: sp 0.7s linear infinite; }
+    @keyframes sp { to { transform: rotate(360deg); } }
+
     @media (max-width: 900px) {
-      .settings-panel {
-        top: auto;
-        right: 14px;
-        left: 14px;
-        bottom: 18px;
-        width: auto;
-      }
-      .time-panel {
-        left: 14px;
-        right: 14px;
-        width: auto;
-      }
-      .legend-stack {
-        bottom: 20px;
-      }
+      :root { --left-w: 0px; --right-w: 0px; }
+      #poi-sidebar, #layer-panel { display: none; }
+      #time-panel { right: 0; width: 100%; }
     }
   </style>
 </head>
 <body>
-  <div id="map"></div>
 
-  <div id="layer-control" class="floating-control">
-    <div class="control-header">
-      <h1 class="control-title">SBAS Layer Viewer</h1>
-      <div id="dataset-label" class="control-subtitle"></div>
+  <header id="top-bar">
+    <button id="sidebar-toggle" title="Toggle POI sidebar">☰</button>
+    <span id="top-title">InSAR SBAS Viewer</span>
+    <span id="top-meta"></span>
+    <div class="top-spacer"></div>
+    <button id="about-btn">ℹ About dataset</button>
+  </header>
+
+  <aside id="poi-sidebar">
+    <div class="sidebar-head">
+      <span class="sidebar-head-label">Points of Interest</span>
+      <span id="poi-count"></span>
     </div>
-    <details class="layer-section" open>
-      <summary>Ground Maps</summary>
-      <div id="base-layer-list"></div>
-    </details>
-    <details class="layer-section" open>
-      <summary>Data Overlays</summary>
-      <div id="data-layer-list"></div>
-    </details>
+    <div id="poi-list"></div>
+  </aside>
+
+  <div id="map"></div>
+  <div id="legend-stack"></div>
+
+  <aside id="layer-panel">
+    <div class="panel-head">
+      <span class="panel-head-label">Layers</span>
+    </div>
+    <div id="layer-panel-scroll">
+      <div class="layer-section">
+        <div class="layer-section-title" id="sec-basemaps">Basemaps <span class="chev">▾</span></div>
+        <div id="base-layer-list"></div>
+      </div>
+      <div class="layer-section">
+        <div class="layer-section-title" id="sec-data">Data Overlays <span class="chev">▾</span></div>
+        <div id="data-layer-list"></div>
+      </div>
+    </div>
+    <div id="coh-filter-section">
+      <div class="coh-title">Coherence Filter</div>
+      <div class="coh-toggle-row">
+        <span class="coh-toggle-label">Apply threshold filter</span>
+        <label class="toggle-sw">
+          <input type="checkbox" id="coh-filter-toggle" />
+          <span class="toggle-track"></span>
+        </label>
+      </div>
+      <div class="coh-slider-labels"><span>0.10</span><span>0.90</span></div>
+      <input type="range" id="coh-slider" min="10" max="90" step="5" value="45" />
+      <div id="coh-threshold-display">0.45</div>
+      <div id="coh-pixel-count"><span class="spin"></span></div>
+    </div>
+  </aside>
+
+  <div id="time-panel">
+    <div id="time-panel-head">
+      <h2>Pixel Time Series</h2>
+      <button id="close-time-panel">&#x2715;</button>
+    </div>
+    <div id="pixel-summary"></div>
+    <div id="ts-chart-wrap"><div id="ts-chart"></div></div>
   </div>
 
-  <div id="settings-panel" class="settings-panel panel-hidden"></div>
-  <div id="time-panel" class="time-panel panel-hidden"></div>
-  <div id="legend-stack" class="legend-stack"></div>
-  <div id="toast" class="toast panel-hidden"></div>
+  <div id="about-backdrop"></div>
+  <div id="about-modal" role="dialog" aria-modal="true">
+    <div id="about-modal-head">
+      <h2>About this dataset</h2>
+      <button id="close-about">&#x2715;</button>
+    </div>
+    <div id="about-body"></div>
+  </div>
 
-  <script>
-    const PRIMARY_DISPLACEMENT_LAYER = "sbas_displacement_masked";
-    const state = {
-      map: null,
-      payload: null,
-      baseLayers: {},
-      dataLayers: {},
-      aoiLayer: null,
-      selectedLayer: null,
-      layerState: {},
-      settingsTarget: null,
-      toastTimer: null,
-    };
-    window.insarViewer = state;
+  <footer id="bottom-bar">
+    <button id="velocity-btn" class="active">Velocity</button>
+    <span class="date-edge" id="date-start-lbl"></span>
+    <div id="date-slider-track"><input type="range" id="date-slider" min="0" step="1" value="0" /></div>
+    <span class="date-edge" id="date-end-lbl"></span>
+    <span id="current-date-label">—</span>
+  </footer>
 
-    const stopPropagation = (element) => {
-      L.DomEvent.disableClickPropagation(element);
-      L.DomEvent.disableScrollPropagation(element);
-    };
+  <div id="toast"></div>
 
-    document.querySelectorAll(".floating-control, .settings-panel, .time-panel").forEach(stopPropagation);
+<script>
+"use strict";
 
-    function escapeHtml(value) {
-      return String(value).replace(/[&<>"']/g, (char) => ({
-        "&": "&amp;",
-        "<": "&lt;",
-        ">": "&gt;",
-        "\"": "&quot;",
-        "'": "&#39;",
-      }[char]));
-    }
+// ── Constants ──────────────────────────────────────────────────────────────────
+const SEG_COLORS = ["#2166ac","#e08214","#4dac26","#9e0142","#abd9e9"];
+const PRIMARY_VEL_KEY = "sbas_velocity_masked";
+const DISP_KEY = "sbas_displacement_masked";
 
-    function formatMetric(value, units) {
-      if (value === null || value === undefined || Number.isNaN(value)) return "no data";
-      const abs = Math.abs(value);
-      const number = abs >= 100 ? value.toFixed(0) : abs >= 10 ? value.toFixed(1) : value.toFixed(3);
-      return `${number}${units ? ` ${units}` : ""}`;
-    }
+// ── State ──────────────────────────────────────────────────────────────────────
+const S = {
+  map: null, payload: null, cohGrid: null,
+  baseLayers: {}, dataLayers: {}, cohFilterLayer: null,
+  aoiLayer: null, selectionLayer: null,
+  layerEnabled: {}, layerOpacity: {}, layerDateIndex: {},
+  mode: "velocity",
+  dateIndex: 0,
+  cohThreshold: 0.45,
+  cohFilterEnabled: false,
+  activePoi: null,
+  toastTimer: null,
+};
 
-    function layerImageUrl(layer, dateIndex) {
-      const index = layer.temporal ? dateIndex : 0;
-      return `/overlay/${encodeURIComponent(layer.key)}/${index}.png`;
-    }
+// ── Utilities ──────────────────────────────────────────────────────────────────
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, c =>
+    ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+function fmt(v, unit) {
+  if (v === null || v === undefined || !isFinite(v)) return "—";
+  const a = Math.abs(v), s = a >= 100 ? v.toFixed(0) : a >= 10 ? v.toFixed(1) : v.toFixed(2);
+  return unit ? `${s} ${unit}` : s;
+}
+function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
+function showToast(msg, ms = 2000) {
+  const el = document.getElementById("toast");
+  el.textContent = msg; el.classList.add("visible");
+  clearTimeout(S.toastTimer); S.toastTimer = setTimeout(() => el.classList.remove("visible"), ms);
+}
 
-    function currentDateIndex(layerKey) {
-      return state.layerState[layerKey]?.dateIndex ?? state.payload.defaultDateIndex;
-    }
+// ── Map ────────────────────────────────────────────────────────────────────────
+function initMap(payload) {
+  S.map = L.map("map", { center: payload.center, zoom: payload.defaultZoom, zoomControl: true, preferCanvas: true });
+  S.map.createPane("dataPane"); S.map.getPane("dataPane").style.zIndex = 420;
+  S.map.createPane("aoiPane");  S.map.getPane("aoiPane").style.zIndex = 440;
+  S.map.createPane("selPane");  S.map.getPane("selPane").style.zIndex = 460;
+  L.control.scale({ imperial: false }).addTo(S.map);
+  S.map.fitBounds(payload.bounds, { padding: [20, 20] });
 
-    function initMap(payload) {
-      state.map = L.map("map", {
-        center: payload.center,
-        zoom: payload.defaultZoom,
-        zoomControl: true,
-        preferCanvas: true,
-      });
-      state.map.createPane("dataPane");
-      state.map.getPane("dataPane").style.zIndex = 420;
-      state.map.createPane("aoiPane");
-      state.map.getPane("aoiPane").style.zIndex = 440;
-      state.map.createPane("selectionPane");
-      state.map.getPane("selectionPane").style.zIndex = 460;
-      L.control.scale().addTo(state.map);
-      state.map.fitBounds(payload.bounds, { padding: [20, 20] });
-      document.getElementById("map").addEventListener("click", onMapContainerClick);
-      document.addEventListener("click", onDocumentMapClick, true);
-    }
+  const stopProp = el => { L.DomEvent.disableClickPropagation(el); L.DomEvent.disableScrollPropagation(el); };
+  ["poi-sidebar","layer-panel","time-panel","bottom-bar","top-bar"].forEach(id => {
+    const el = document.getElementById(id); if (el) stopProp(el);
+  });
+  document.getElementById("map").addEventListener("click", onMapClick);
+}
 
-    function initLayerState(payload) {
-      [...payload.baseLayers, ...payload.dataLayers].forEach((layer) => {
-        state.layerState[layer.key] = {
-          enabled: layer.defaultEnabled,
-          opacity: layer.defaultOpacity,
-          dateIndex: payload.defaultDateIndex,
-        };
-      });
-    }
+function onMapClick(e) {
+  if (e.target.closest("#poi-sidebar,#layer-panel,#time-panel,#top-bar,#bottom-bar,#about-modal")) return;
+  const rect = document.getElementById("map").getBoundingClientRect();
+  const pt = L.point(e.clientX - rect.left, e.clientY - rect.top);
+  fetchPixel(S.map.containerPointToLatLng(pt));
+}
 
-    function addBaseLayer(layer) {
-      if (!state.baseLayers[layer.key]) {
-        state.baseLayers[layer.key] = L.tileLayer(layer.url, {
-          maxZoom: layer.maxZoom,
-          maxNativeZoom: layer.maxZoom,
-          opacity: state.layerState[layer.key].opacity,
-          attribution: layer.attribution,
-        });
-      }
-      if (state.layerState[layer.key].enabled && !state.map.hasLayer(state.baseLayers[layer.key])) {
-        state.baseLayers[layer.key].addTo(state.map);
-      }
-    }
+// ── Layer state init ───────────────────────────────────────────────────────────
+function initLayerState(payload) {
+  for (const l of [...payload.baseLayers, ...payload.dataLayers]) {
+    S.layerEnabled[l.key] = l.defaultEnabled;
+    S.layerOpacity[l.key] = l.defaultOpacity;
+    S.layerDateIndex[l.key] = payload.defaultDateIndex;
+  }
+  S.dateIndex = payload.defaultDateIndex;
+}
 
-    function updateBaseLayer(layer) {
-      addBaseLayer(layer);
-      const object = state.baseLayers[layer.key];
-      object.setOpacity(state.layerState[layer.key].opacity);
-      if (state.layerState[layer.key].enabled) {
-        if (!state.map.hasLayer(object)) object.addTo(state.map);
-      } else if (state.map.hasLayer(object)) {
-        state.map.removeLayer(object);
-      }
-    }
-
-    function updateDataLayer(layer) {
-      if (layer.kind === "aoi") {
-        updateAoiLayer(layer);
-        return;
-      }
-
-      const layerState = state.layerState[layer.key];
-      if (!state.dataLayers[layer.key]) {
-        state.dataLayers[layer.key] = L.imageOverlay(
-          layerImageUrl(layer, layerState.dateIndex),
-          state.payload.bounds,
-          {
-            opacity: layerState.opacity,
-            pane: "dataPane",
-            interactive: false,
-          },
-        );
-      }
-
-      const object = state.dataLayers[layer.key];
-      object.setOpacity(layerState.opacity);
-      object.setUrl(layerImageUrl(layer, layerState.dateIndex));
-
-      if (layerState.enabled) {
-        if (!state.map.hasLayer(object)) object.addTo(state.map);
-      } else if (state.map.hasLayer(object)) {
-        state.map.removeLayer(object);
-      }
-      renderLegends();
-    }
-
-    function updateAoiLayer(layer) {
-      const layerState = state.layerState[layer.key];
-      if (!state.payload.aoi) return;
-
-      if (!state.aoiLayer) {
-        state.aoiLayer = L.polygon(state.payload.aoi, {
-          pane: "aoiPane",
-          color: "#ffcc33",
-          weight: 3,
-          opacity: layerState.opacity,
-          fillColor: "#ffcc33",
-          fillOpacity: 0.08 * layerState.opacity,
-          interactive: false,
-        });
-      }
-
-      state.aoiLayer.setStyle({
-        opacity: layerState.opacity,
-        fillOpacity: 0.08 * layerState.opacity,
-      });
-
-      if (layerState.enabled) {
-        if (!state.map.hasLayer(state.aoiLayer)) state.aoiLayer.addTo(state.map);
-      } else if (state.map.hasLayer(state.aoiLayer)) {
-        state.map.removeLayer(state.aoiLayer);
-      }
-    }
-
-    function createLayerRow(layer, group) {
-      const row = document.createElement("div");
-      row.className = "layer-row";
-      row.innerHTML = `
-        <label class="layer-check">
-          <input type="checkbox" ${layer.defaultEnabled ? "checked" : ""} />
-          <span>${escapeHtml(layer.label)}</span>
-        </label>
-        <button class="icon-button" type="button" title="Layer settings" aria-label="Layer settings for ${escapeHtml(layer.label)}">
-          <i data-lucide="settings"></i>
-        </button>
-      `;
-
-      const checkbox = row.querySelector("input");
-      checkbox.addEventListener("change", () => {
-        state.layerState[layer.key].enabled = checkbox.checked;
-        group === "base" ? updateBaseLayer(layer) : updateDataLayer(layer);
-      });
-
-      row.querySelector("button").addEventListener("click", () => openSettings(layer, group));
-      return row;
-    }
-
-    function renderLayerLists(payload) {
-      document.getElementById("dataset-label").textContent = payload.dataset.split(/[\\/]/).pop();
-      const baseList = document.getElementById("base-layer-list");
-      const dataList = document.getElementById("data-layer-list");
-      payload.baseLayers.forEach((layer) => baseList.appendChild(createLayerRow(layer, "base")));
-      payload.dataLayers.forEach((layer) => dataList.appendChild(createLayerRow(layer, "data")));
-      lucide.createIcons();
-    }
-
-    function openSettings(layer, group) {
-      state.settingsTarget = { key: layer.key, group };
-      const panel = document.getElementById("settings-panel");
-      const layerState = state.layerState[layer.key];
-      const dates = state.payload.dates;
-      const dateControl = layer.temporal ? `
-        <div class="setting-group">
-          <label class="setting-label" for="setting-date">
-            <span>Date</span><span>${escapeHtml(dates[layerState.dateIndex] || "")}</span>
-          </label>
-          <select id="setting-date" class="setting-select">
-            ${dates.map((date, index) => `<option value="${index}" ${index === layerState.dateIndex ? "selected" : ""}>${escapeHtml(date)}</option>`).join("")}
-          </select>
-        </div>
-      ` : "";
-
-      panel.innerHTML = `
-        <div class="panel-header">
-          <h2 class="panel-title">${escapeHtml(layer.label)}</h2>
-          <button class="icon-button" type="button" id="close-settings" aria-label="Close settings">
-            <i data-lucide="x"></i>
-          </button>
-        </div>
-        <div class="panel-body">
-          <div class="setting-group">
-            <label class="setting-label" for="setting-opacity">
-              <span>Opacity</span><span id="opacity-value">${Math.round(layerState.opacity * 100)}%</span>
-            </label>
-            <input id="setting-opacity" class="setting-slider" type="range" min="0" max="100" step="5" value="${Math.round(layerState.opacity * 100)}" />
-          </div>
-          ${dateControl}
-        </div>
-      `;
-      panel.classList.remove("panel-hidden");
-      stopPropagation(panel);
-      lucide.createIcons();
-
-      panel.querySelector("#close-settings").addEventListener("click", () => {
-        panel.classList.add("panel-hidden");
-      });
-
-      panel.querySelector("#setting-opacity").addEventListener("input", (event) => {
-        const opacity = Number(event.target.value) / 100;
-        state.layerState[layer.key].opacity = opacity;
-        panel.querySelector("#opacity-value").textContent = `${event.target.value}%`;
-        group === "base" ? updateBaseLayer(layer) : updateDataLayer(layer);
-      });
-
-      const dateSelect = panel.querySelector("#setting-date");
-      if (dateSelect) {
-        dateSelect.addEventListener("change", (event) => {
-          state.layerState[layer.key].dateIndex = Number(event.target.value);
-          updateDataLayer(layer);
-          openSettings(layer, group);
-        });
-      }
-    }
-
-    function renderLegends() {
-      const stack = document.getElementById("legend-stack");
-      stack.innerHTML = "";
-      state.payload.dataLayers.forEach((layer) => {
-        const layerState = state.layerState[layer.key];
-        if (!layerState.enabled || layer.kind === "aoi" || !layer.legend) return;
-        const gradient = `linear-gradient(to right, ${layer.legend.colors.join(",")})`;
-        const card = document.createElement("div");
-        card.className = "legend-card";
-        card.innerHTML = `
-          <div class="legend-title">${escapeHtml(layer.label)}</div>
-          ${layer.temporal ? `<div class="legend-date">${escapeHtml(state.payload.dates[layerState.dateIndex] || "")}</div>` : ""}
-          <div class="legend-scale">
-            <span>${escapeHtml(layer.legend.low)}</span>
-            <span class="legend-gradient" style="background:${gradient}"></span>
-            <span>${escapeHtml(layer.legend.high)}</span>
-          </div>
-        `;
-        stack.appendChild(card);
-      });
-    }
-
-    function svgPoint(x, y) {
-      return `${x.toFixed(1)},${y.toFixed(1)}`;
-    }
-
-    function buildTimeSeriesSvg(info) {
-      const width = 350;
-      const height = 190;
-      const margin = { left: 42, right: 12, top: 12, bottom: 34 };
-      const plotWidth = width - margin.left - margin.right;
-      const plotHeight = height - margin.top - margin.bottom;
-      const values = info.series.flatMap((series) => series.values.filter((value) => value !== null));
-      if (!values.length) return "<div class='control-subtitle'>No finite displacement values for this pixel.</div>";
-
-      let minY = Math.min(...values);
-      let maxY = Math.max(...values);
-      if (minY === maxY) {
-        minY -= 1;
-        maxY += 1;
-      }
-      const yPadding = (maxY - minY) * 0.12;
-      minY -= yPadding;
-      maxY += yPadding;
-
-      const xFor = (index) => margin.left + (info.dates.length <= 1 ? 0 : (index / (info.dates.length - 1)) * plotWidth);
-      const yFor = (value) => margin.top + ((maxY - value) / (maxY - minY)) * plotHeight;
-      const zeroY = yFor(Math.max(minY, Math.min(maxY, 0)));
-
-      const lines = info.series.map((series) => {
-        const points = series.values
-          .map((value, index) => value === null ? null : [xFor(index), yFor(value)])
-          .filter(Boolean);
-        if (!points.length) return "";
-        const path = points.map((point, index) => `${index === 0 ? "M" : "L"} ${svgPoint(point[0], point[1])}`).join(" ");
-        const circles = points.map((point) => `<circle cx="${point[0].toFixed(1)}" cy="${point[1].toFixed(1)}" r="2.8" fill="${series.color}"></circle>`).join("");
-        return `<path d="${path}" fill="none" stroke="${series.color}" stroke-width="2.4"></path>${circles}`;
-      }).join("");
-
-      const firstDate = info.dates[0] || "";
-      const lastDate = info.dates[info.dates.length - 1] || "";
-      const ticks = [minY, 0, maxY]
-        .filter((value, index, array) => array.indexOf(value) === index)
-        .map((value) => {
-          const y = yFor(value);
-          return `
-            <line x1="${margin.left}" x2="${width - margin.right}" y1="${y.toFixed(1)}" y2="${y.toFixed(1)}" stroke="#e2eaed"></line>
-            <text x="${margin.left - 8}" y="${(y + 4).toFixed(1)}" text-anchor="end" font-size="10" fill="#607078">${formatMetric(value, "")}</text>
-          `;
-        }).join("");
-
-      return `
-        <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Pixel displacement time series">
-          <rect x="0" y="0" width="${width}" height="${height}" fill="#ffffff"></rect>
-          ${ticks}
-          <line x1="${margin.left}" x2="${width - margin.right}" y1="${zeroY.toFixed(1)}" y2="${zeroY.toFixed(1)}" stroke="#9aa7ad" stroke-dasharray="4 4"></line>
-          <line x1="${margin.left}" x2="${margin.left}" y1="${margin.top}" y2="${height - margin.bottom}" stroke="#9aa7ad"></line>
-          <line x1="${margin.left}" x2="${width - margin.right}" y1="${height - margin.bottom}" y2="${height - margin.bottom}" stroke="#9aa7ad"></line>
-          ${lines}
-          <text x="${margin.left}" y="${height - 10}" text-anchor="start" font-size="10" fill="#607078">${escapeHtml(firstDate)}</text>
-          <text x="${width - margin.right}" y="${height - 10}" text-anchor="end" font-size="10" fill="#607078">${escapeHtml(lastDate)}</text>
-          <text x="12" y="${margin.top + plotHeight / 2}" transform="rotate(-90 12 ${margin.top + plotHeight / 2})" text-anchor="middle" font-size="10" fill="#607078">mm</text>
-        </svg>
-      `;
-    }
-
-    function showTimePanel(info) {
-      const panel = document.getElementById("time-panel");
-      const chartLegend = info.series.map((series) => `
-        <span><span class="legend-dot" style="background:${series.color}"></span>${escapeHtml(series.label)}</span>
-      `).join("");
-      const metrics = [
-        { label: "Longitude", value: info.lon.toFixed(6) },
-        { label: "Latitude", value: info.lat.toFixed(6) },
-        ...info.metrics.filter((metric) => metric.value !== null).slice(0, 4).map((metric) => ({
-          label: metric.label,
-          value: formatMetric(metric.value, metric.units),
-        })),
-      ];
-
-      panel.innerHTML = `
-        <div class="panel-header">
-          <h2 class="panel-title">Pixel deformation</h2>
-          <button class="icon-button" type="button" id="close-time" aria-label="Close time series">
-            <i data-lucide="x"></i>
-          </button>
-        </div>
-        <div class="panel-body">
-          <div class="pixel-meta">
-            ${metrics.map((metric) => `
-              <div class="metric">
-                <div class="metric-label">${escapeHtml(metric.label)}</div>
-                <div class="metric-value">${escapeHtml(metric.value)}</div>
-              </div>
-            `).join("")}
-          </div>
-          <div class="chart-wrap">${buildTimeSeriesSvg(info)}</div>
-          <div class="chart-legend">${chartLegend}</div>
-        </div>
-      `;
-      panel.classList.remove("panel-hidden");
-      stopPropagation(panel);
-      panel.querySelector("#close-time").addEventListener("click", () => panel.classList.add("panel-hidden"));
-      lucide.createIcons();
-    }
-
-    function updateSelectedPixel(info) {
-      if (state.selectedLayer) {
-        state.map.removeLayer(state.selectedLayer);
-      }
-      state.selectedLayer = L.rectangle(info.cellBounds, {
-        pane: "selectionPane",
-        color: "#ffcc33",
-        weight: 2,
-        opacity: 1,
-        fill: false,
-        interactive: false,
-      }).addTo(state.map);
-    }
-
-    function showToast(message) {
-      const toast = document.getElementById("toast");
-      toast.textContent = message;
-      toast.classList.remove("panel-hidden");
-      clearTimeout(state.toastTimer);
-      state.toastTimer = setTimeout(() => toast.classList.add("panel-hidden"), 1800);
-    }
-
-    function onMapContainerClick(event) {
-      if (event.target.closest(".leaflet-control, .floating-control, .settings-panel, .time-panel")) return;
-      event.stopPropagation();
-      routeMapClick(event);
-    }
-
-    function onDocumentMapClick(event) {
-      if (event.target.closest(".leaflet-control, .floating-control, .settings-panel, .time-panel")) return;
-      if (!document.getElementById("map").contains(event.target)) return;
-      routeMapClick(event);
-    }
-
-    function routeMapClick(event) {
-      if (event.insarHandled) return;
-      event.insarHandled = true;
-      document.body.dataset.lastMapClick = `${event.clientX},${event.clientY}`;
-      const rect = document.getElementById("map").getBoundingClientRect();
-      const point = L.point(event.clientX - rect.left, event.clientY - rect.top);
-      handleMapLatLng(state.map.containerPointToLatLng(point));
-    }
-
-    async function handleMapLatLng(latlng) {
-      const dateIndex = currentDateIndex(PRIMARY_DISPLACEMENT_LAYER);
-      const response = await fetch(`/api/pixel?lat=${latlng.lat}&lon=${latlng.lng}&date=${dateIndex}`);
-      if (!response.ok) {
-        showToast("Pixel lookup failed");
-        return;
-      }
-      const info = await response.json();
-      if (!info.found) {
-        showToast("No deformation pixel here");
-        return;
-      }
-      updateSelectedPixel(info);
-      showTimePanel(info);
-    }
-
-    function applyInitialLayers(payload) {
-      payload.baseLayers.forEach(updateBaseLayer);
-      payload.dataLayers.forEach(updateDataLayer);
-      renderLegends();
-    }
-
-    async function boot() {
-      const response = await fetch("/api/viewer");
-      const payload = await response.json();
-      state.payload = payload;
-      initLayerState(payload);
-      initMap(payload);
-      renderLayerLists(payload);
-      applyInitialLayers(payload);
-    }
-
-    boot().catch((error) => {
-      console.error(error);
-      showToast("Viewer failed to start");
+// ── Layer sync ─────────────────────────────────────────────────────────────────
+function syncBase(layer) {
+  if (!S.baseLayers[layer.key]) {
+    S.baseLayers[layer.key] = L.tileLayer(layer.url, {
+      maxZoom: layer.maxZoom, maxNativeZoom: layer.maxZoom,
+      opacity: S.layerOpacity[layer.key], attribution: layer.attribution,
     });
-  </script>
+  }
+  S.baseLayers[layer.key].setOpacity(S.layerOpacity[layer.key]);
+  const on = S.layerEnabled[layer.key];
+  if (on && !S.map.hasLayer(S.baseLayers[layer.key])) S.baseLayers[layer.key].addTo(S.map);
+  else if (!on && S.map.hasLayer(S.baseLayers[layer.key])) S.map.removeLayer(S.baseLayers[layer.key]);
+}
+
+function syncData(layer) {
+  if (layer.kind === "aoi") { syncAoi(layer); return; }
+  const idx = layer.temporal ? S.layerDateIndex[layer.key] : 0;
+  const url = `/overlay/${encodeURIComponent(layer.key)}/${idx}.png`;
+  if (!S.dataLayers[layer.key]) {
+    S.dataLayers[layer.key] = L.imageOverlay(url, S.payload.bounds, { opacity: S.layerOpacity[layer.key], pane: "dataPane", interactive: false });
+  } else {
+    S.dataLayers[layer.key].setUrl(url);
+  }
+  S.dataLayers[layer.key].setOpacity(S.layerOpacity[layer.key]);
+  const on = S.layerEnabled[layer.key];
+  if (on && !S.map.hasLayer(S.dataLayers[layer.key])) S.dataLayers[layer.key].addTo(S.map);
+  else if (!on && S.map.hasLayer(S.dataLayers[layer.key])) S.map.removeLayer(S.dataLayers[layer.key]);
+  renderLegends();
+}
+
+function syncAoi(layer) {
+  if (!S.payload.aoi) return;
+  if (!S.aoiLayer) {
+    S.aoiLayer = L.polygon(S.payload.aoi, {
+      pane: "aoiPane", color: "#29b6f6", weight: 2, opacity: 0.8,
+      fillColor: "#29b6f6", fillOpacity: 0.04, interactive: false,
+    });
+  }
+  const on = S.layerEnabled[layer.key];
+  if (on && !S.map.hasLayer(S.aoiLayer)) S.aoiLayer.addTo(S.map);
+  else if (!on && S.map.hasLayer(S.aoiLayer)) S.map.removeLayer(S.aoiLayer);
+}
+
+// ── Layer UI ───────────────────────────────────────────────────────────────────
+function buildLayerRow(layer, group) {
+  const frag = document.createDocumentFragment();
+
+  const row = document.createElement("div");
+  row.className = "layer-row"; row.dataset.key = layer.key;
+
+  const lbl = document.createElement("label"); lbl.className = "layer-check";
+  const chk = document.createElement("input"); chk.type = "checkbox"; chk.checked = layer.defaultEnabled;
+  chk.addEventListener("change", () => {
+    S.layerEnabled[layer.key] = chk.checked;
+    group === "base" ? syncBase(layer) : syncData(layer);
+  });
+  const span = document.createElement("span"); span.className = "layer-label"; span.textContent = layer.label;
+  lbl.appendChild(chk); lbl.appendChild(span); row.appendChild(lbl);
+
+  const opBtn = document.createElement("button"); opBtn.className = "op-btn"; opBtn.title = "Opacity"; opBtn.textContent = "◑";
+  row.appendChild(opBtn);
+  frag.appendChild(row);
+
+  const opWrap = document.createElement("div"); opWrap.className = "op-wrap";
+  const opSlider = document.createElement("input"); opSlider.type = "range"; opSlider.min = 0; opSlider.max = 100; opSlider.step = 5;
+  opSlider.value = Math.round(layer.defaultOpacity * 100);
+  opSlider.addEventListener("input", () => {
+    S.layerOpacity[layer.key] = opSlider.value / 100;
+    group === "base" ? syncBase(layer) : syncData(layer);
+  });
+  opWrap.appendChild(opSlider);
+
+  if (layer.temporal && S.payload.dates.length) {
+    const sel = document.createElement("select");
+    S.payload.dates.forEach((d, i) => {
+      const opt = document.createElement("option"); opt.value = i; opt.textContent = d;
+      if (i === S.payload.defaultDateIndex) opt.selected = true;
+      sel.appendChild(opt);
+    });
+    sel.addEventListener("change", () => {
+      S.layerDateIndex[layer.key] = parseInt(sel.value);
+      syncData(layer);
+    });
+    opWrap.appendChild(sel);
+  }
+  frag.appendChild(opWrap);
+
+  opBtn.addEventListener("click", () => {
+    const isOpen = opWrap.classList.toggle("open");
+    if (isOpen) {
+      document.querySelectorAll(".op-wrap.open").forEach(w => { if (w !== opWrap) w.classList.remove("open"); });
+      opWrap.classList.add("open");
+    }
+  });
+
+  return frag;
+}
+
+function renderLayerLists(payload) {
+  document.getElementById("top-meta").textContent = `· ${payload.dataset}`;
+  const baseList = document.getElementById("base-layer-list");
+  const dataList = document.getElementById("data-layer-list");
+  payload.baseLayers.forEach(l => baseList.appendChild(buildLayerRow(l, "base")));
+  payload.dataLayers.forEach(l => dataList.appendChild(buildLayerRow(l, "data")));
+
+  // Section collapse toggles
+  document.querySelectorAll(".layer-section-title").forEach(title => {
+    title.addEventListener("click", () => {
+      const body = title.nextElementSibling;
+      const collapsed = title.classList.toggle("collapsed");
+      body.style.display = collapsed ? "none" : "";
+    });
+  });
+}
+
+// ── Legends ────────────────────────────────────────────────────────────────────
+function renderLegends() {
+  const stack = document.getElementById("legend-stack"); stack.innerHTML = "";
+  for (const layer of S.payload.dataLayers) {
+    if (!S.layerEnabled[layer.key] || layer.kind === "aoi" || !layer.legend) continue;
+    const dateStr = layer.temporal ? (S.payload.dates[S.layerDateIndex[layer.key]] || "") : "";
+    const card = document.createElement("div"); card.className = "legend-card";
+    card.innerHTML = `
+      <div class="legend-title">${esc(layer.label)}</div>
+      ${dateStr ? `<div class="legend-date">${esc(dateStr)}</div>` : ""}
+      <div class="legend-scale">
+        <span>${esc(layer.legend.low)}</span>
+        <span class="legend-gradient" style="background:linear-gradient(to right,${layer.legend.colors.join(",")})"></span>
+        <span>${esc(layer.legend.high)}</span>
+      </div>`;
+    stack.appendChild(card);
+  }
+  if (S.cohFilterEnabled) {
+    const rng = S.payload.velocityRange;
+    const card = document.createElement("div"); card.className = "legend-card";
+    card.innerHTML = `
+      <div class="legend-title">Velocity coh ≥ ${S.cohThreshold.toFixed(2)} (mm/yr)</div>
+      <div class="legend-scale">
+        <span>${fmt(rng[0])}</span>
+        <span class="legend-gradient" style="background:linear-gradient(to right,#08306b,#f7f7f7,#67000d)"></span>
+        <span>${fmt(rng[1])}</span>
+      </div>`;
+    stack.appendChild(card);
+  }
+}
+
+// ── Coherence filter ───────────────────────────────────────────────────────────
+async function loadCohGrid() {
+  try {
+    S.cohGrid = await fetch("/api/coherence_grid").then(r => r.json());
+    updateCohCount();
+  } catch { S.cohGrid = null; document.getElementById("coh-pixel-count").textContent = "—"; }
+}
+
+function computePixelCount(thr) {
+  if (!S.cohGrid?.available) return null;
+  const { values, valid_mask, total_valid } = S.cohGrid;
+  let count = 0;
+  for (let i = 0; i < values.length; i++) {
+    if (valid_mask[i] && values[i] !== null && values[i] >= thr) count++;
+  }
+  return { count, total: total_valid, pct: Math.round(count / total_valid * 100) };
+}
+
+function updateCohCount() {
+  const el = document.getElementById("coh-pixel-count");
+  const r = computePixelCount(S.cohThreshold);
+  el.textContent = r ? `${r.count.toLocaleString()} px visible (${r.pct}% of AOI)` : "—";
+}
+
+const debouncedCohOverlay = debounce(updateCohFilterOverlay, 300);
+
+function updateCohFilterOverlay() {
+  if (!S.cohFilterEnabled) {
+    if (S.cohFilterLayer && S.map.hasLayer(S.cohFilterLayer)) S.map.removeLayer(S.cohFilterLayer);
+    // Restore velocity if it was the active layer
+    const vel = S.payload.dataLayers.find(l => l.key === PRIMARY_VEL_KEY);
+    if (vel && S.layerEnabled[PRIMARY_VEL_KEY]) syncData(vel);
+    renderLegends(); return;
+  }
+  // Hide standard velocity layers
+  for (const key of [PRIMARY_VEL_KEY, "sbas_velocity_raw"]) {
+    if (S.dataLayers[key] && S.map.hasLayer(S.dataLayers[key])) S.map.removeLayer(S.dataLayers[key]);
+  }
+  const pct = Math.round(S.cohThreshold * 100);
+  const url = `/overlay/velocity_coh_filtered/${pct}.png`;
+  if (!S.cohFilterLayer) {
+    S.cohFilterLayer = L.imageOverlay(url, S.payload.bounds, { opacity: 0.87, pane: "dataPane", interactive: false });
+    S.cohFilterLayer.addTo(S.map);
+  } else {
+    if (!S.map.hasLayer(S.cohFilterLayer)) S.cohFilterLayer.addTo(S.map);
+    S.cohFilterLayer.setUrl(url);
+  }
+  renderLegends();
+}
+
+function initCohFilter(payload) {
+  S.cohThreshold = payload.cohThresholdDefault;
+  const slider = document.getElementById("coh-slider");
+  const display = document.getElementById("coh-threshold-display");
+  slider.value = Math.round(S.cohThreshold * 100);
+  display.textContent = S.cohThreshold.toFixed(2);
+
+  slider.addEventListener("input", () => {
+    S.cohThreshold = parseInt(slider.value) / 100;
+    display.textContent = S.cohThreshold.toFixed(2);
+    updateCohCount();
+    if (S.cohFilterEnabled) debouncedCohOverlay();
+  });
+  document.getElementById("coh-filter-toggle").addEventListener("change", e => {
+    S.cohFilterEnabled = e.target.checked;
+    updateCohFilterOverlay();
+  });
+}
+
+// ── Date slider ────────────────────────────────────────────────────────────────
+function initDateSlider(payload) {
+  const slider = document.getElementById("date-slider");
+  const curLbl = document.getElementById("current-date-label");
+  if (!payload.dates.length) { slider.disabled = true; return; }
+
+  slider.max = payload.dates.length - 1;
+  slider.value = payload.defaultDateIndex;
+  document.getElementById("date-start-lbl").textContent = payload.dates[0];
+  document.getElementById("date-end-lbl").textContent = payload.dates[payload.dates.length - 1];
+  curLbl.textContent = payload.dates[payload.defaultDateIndex];
+
+  slider.addEventListener("input", () => {
+    const idx = parseInt(slider.value);
+    curLbl.textContent = payload.dates[idx];
+    enterDateMode(idx);
+  });
+  document.getElementById("velocity-btn").addEventListener("click", enterVelocityMode);
+}
+
+function enterDateMode(idx) {
+  S.mode = "date"; S.dateIndex = idx;
+  document.getElementById("velocity-btn").classList.remove("active");
+  // Hide velocity; show displacement at idx
+  for (const key of [PRIMARY_VEL_KEY, "sbas_velocity_raw"]) {
+    if (S.dataLayers[key] && S.map.hasLayer(S.dataLayers[key])) S.map.removeLayer(S.dataLayers[key]);
+  }
+  if (S.cohFilterLayer && S.map.hasLayer(S.cohFilterLayer)) S.map.removeLayer(S.cohFilterLayer);
+  S.layerEnabled[DISP_KEY] = true;
+  S.layerDateIndex[DISP_KEY] = idx;
+  const dl = S.payload.dataLayers.find(l => l.key === DISP_KEY);
+  if (dl) syncData(dl);
+  // Sync checkbox
+  const chk = document.querySelector(`[data-key="${DISP_KEY}"] input[type=checkbox]`);
+  if (chk) chk.checked = true;
+  renderLegends();
+}
+
+function enterVelocityMode() {
+  S.mode = "velocity";
+  document.getElementById("velocity-btn").classList.add("active");
+  // Restore velocity layer
+  const vel = S.payload.dataLayers.find(l => l.key === PRIMARY_VEL_KEY);
+  if (vel && S.layerEnabled[PRIMARY_VEL_KEY]) syncData(vel);
+  // Hide displacement if user didn't explicitly enable it
+  if (!S.layerEnabled[DISP_KEY]) {
+    if (S.dataLayers[DISP_KEY] && S.map.hasLayer(S.dataLayers[DISP_KEY])) S.map.removeLayer(S.dataLayers[DISP_KEY]);
+  }
+  if (S.cohFilterEnabled) updateCohFilterOverlay();
+  renderLegends();
+}
+
+// ── POI sidebar ────────────────────────────────────────────────────────────────
+function renderPoiList(pois) {
+  const list = document.getElementById("poi-list");
+  document.getElementById("poi-count").textContent = pois.length || "";
+  list.innerHTML = "";
+  if (!pois.length) {
+    list.innerHTML = `<div style="padding:14px;font-size:11px;color:var(--text2)">No POIs in this dataset.</div>`;
+    return;
+  }
+  pois.forEach(poi => {
+    const item = document.createElement("div"); item.className = "poi-item";
+    item.innerHTML = `
+      <div class="poi-dot"></div>
+      <div>
+        <div class="poi-name">${esc(poi.name)}</div>
+        <div class="poi-coords">${poi.lat.toFixed(5)}, ${poi.lon.toFixed(5)}</div>
+      </div>`;
+    item.addEventListener("click", () => {
+      document.querySelectorAll(".poi-item.active").forEach(el => el.classList.remove("active"));
+      item.classList.add("active");
+      S.map.setView([poi.lat, poi.lon], Math.max(S.map.getZoom(), 14), { animate: true });
+      fetchPixel({ lat: poi.lat, lng: poi.lon });
+    });
+    list.appendChild(item);
+  });
+}
+
+// ── Pixel fetch ────────────────────────────────────────────────────────────────
+async function fetchPixel(latlng) {
+  try {
+    const r = await fetch(`/api/pixel?lat=${latlng.lat}&lon=${latlng.lng}`);
+    const info = await r.json();
+    if (!info.found) { showToast(`No data here (${info.reason || "outside AOI"})`); return; }
+    // Draw selection rectangle
+    if (S.selectionLayer) S.map.removeLayer(S.selectionLayer);
+    S.selectionLayer = L.rectangle(info.cellBounds, {
+      pane: "selPane", color: "#29b6f6", weight: 1.5, opacity: 1,
+      fillColor: "#29b6f6", fillOpacity: 0.07, interactive: false,
+    }).addTo(S.map);
+    showTimePanel(info);
+  } catch (err) { showToast("Pixel lookup failed"); console.error(err); }
+}
+
+// ── Time series panel ──────────────────────────────────────────────────────────
+function buildSummaryHtml(info) {
+  const vel = info.velocity_mm_yr;
+  const velStr = vel !== null ? fmt(vel, "mm/yr") : "masked";
+  const velClass = info.below_static_mask ? "danger" : (Math.abs(vel || 0) > 5 ? "warn" : "ok");
+  const coh = info.coherence_median;
+  const cohStr = coh !== null ? coh.toFixed(3) : "—";
+  const cohClass = coh !== null && coh < 0.35 ? "danger" : coh !== null && coh < 0.5 ? "warn" : "ok";
+
+  let warnHtml = "";
+  if (info.has_gap) {
+    warnHtml = `<div class="gap-warn">⚠&nbsp; Time series has a coherence gap — segments are shown separately and re-zeroed. Do not compare absolute values across segments.</div>`;
+  } else if (info.valid_epoch_count < 3) {
+    warnHtml = `<div class="gap-warn">⚠&nbsp; Only ${info.valid_epoch_count} valid epoch(s) at this pixel — data quality is low.</div>`;
+  } else if (info.below_static_mask) {
+    warnHtml = `<div class="gap-warn">⚠&nbsp; Below the static coherence mask — velocity value is unreliable.</div>`;
+  }
+
+  return `
+    <div class="sum-grid">
+      <div class="sum-card"><div class="sum-label">Latitude</div><div class="sum-value">${info.lat.toFixed(6)}</div></div>
+      <div class="sum-card"><div class="sum-label">Longitude</div><div class="sum-value">${info.lon.toFixed(6)}</div></div>
+      <div class="sum-card"><div class="sum-label">Velocity (LOS)</div><div class="sum-value ${velClass}">${esc(velStr)}</div></div>
+      <div class="sum-card"><div class="sum-label">Coherence (median)</div><div class="sum-value ${cohClass}">${cohStr}</div></div>
+      <div class="sum-card"><div class="sum-label">Valid epochs</div><div class="sum-value">${info.valid_epoch_count} / ${info.total_epoch_count}</div></div>
+      <div class="sum-card"><div class="sum-label">Segments</div><div class="sum-value">${info.segment_count || "—"}</div></div>
+    </div>${warnHtml}`;
+}
+
+function buildPlotlyData(info) {
+  const { dates, series } = info;
+  const { raw, segmented, segment_id, valid_time_mask, coh_per_date } = series;
+  const traces = [];
+
+  const finRaw = raw.filter(v => v !== null);
+  const yMin = finRaw.length ? Math.min(...finRaw) : -1;
+  const yMax = finRaw.length ? Math.max(...finRaw) : 1;
+  const yRange = Math.max(yMax - yMin, 1);
+  const markerY = yMin - yRange * 0.18;
+
+  // Raw (grey dotted)
+  traces.push({
+    x: dates, y: raw, mode: "lines+markers", connectgaps: false,
+    line: { color: "rgba(140,175,200,0.5)", width: 1.5, dash: "dot" },
+    marker: { color: "rgba(140,175,200,0.6)", size: 4 },
+    name: "Raw (all epochs)", yaxis: "y",
+    hovertemplate: "%{x}: %{y:.2f} mm<extra>Raw</extra>",
+  });
+
+  // Segmented — one trace per unique segment
+  const uniqueSegs = [...new Set(segment_id.filter(s => s > 0))].sort((a,b) => a-b);
+  for (const segId of uniqueSegs) {
+    const color = SEG_COLORS[(segId - 1) % SEG_COLORS.length];
+    const segY = segmented.map((v, i) => segment_id[i] === segId ? v : null);
+    traces.push({
+      x: dates, y: segY, mode: "lines+markers", connectgaps: false,
+      line: { color, width: 2.5 }, marker: { color, size: 7, symbol: "circle" },
+      name: uniqueSegs.length > 1 ? `Segment ${segId}` : "Segmented",
+      yaxis: "y",
+      hovertemplate: `%{x}: %{y:.2f} mm<extra>Segment ${segId}</extra>`,
+    });
+  }
+
+  // Dropped dates — hollow red X at bottom of main plot
+  const droppedDates = dates.filter((_, i) => valid_time_mask[i] === 0 && raw[i] !== null);
+  if (droppedDates.length) {
+    traces.push({
+      x: droppedDates, y: droppedDates.map(() => markerY),
+      mode: "markers",
+      marker: { symbol: "x-open", color: "#ef5350", size: 9, line: { width: 2 } },
+      name: "Excluded (low coherence at epoch)", yaxis: "y",
+      hovertemplate: "%{x}: excluded — low coherence at this epoch<extra></extra>",
+    });
+  }
+
+  // Coherence sparkline (y2)
+  if (coh_per_date.some(v => v !== null)) {
+    const barColors = coh_per_date.map(v =>
+      v === null ? "rgba(100,140,170,0.3)" :
+      v >= S.cohThreshold ? "rgba(41,182,246,0.6)" : "rgba(239,83,80,0.5)"
+    );
+    traces.push({
+      x: dates, y: coh_per_date, type: "bar",
+      marker: { color: barColors }, name: "Coherence at epoch",
+      yaxis: "y2", xaxis: "x2",
+      hovertemplate: "%{x}: %{y:.3f}<extra>Coherence</extra>",
+    });
+    // Threshold line
+    traces.push({
+      x: [dates[0], dates[dates.length - 1]], y: [S.cohThreshold, S.cohThreshold],
+      mode: "lines", line: { color: "#ef5350", dash: "dash", width: 1 },
+      yaxis: "y2", xaxis: "x2", showlegend: false, hoverinfo: "skip",
+      name: `Coh. threshold (${S.cohThreshold.toFixed(2)})`,
+    });
+  }
+
+  const layout = {
+    xaxis: { type: "date", showgrid: true, gridcolor: "rgba(255,255,255,0.05)", tickfont: { size: 10, color: "#6a91ae" }, showticklabels: false },
+    xaxis2: { type: "date", matches: "x", showgrid: true, gridcolor: "rgba(255,255,255,0.05)", tickfont: { size: 10, color: "#6a91ae" } },
+    yaxis: {
+      domain: [0.35, 1.0],
+      title: { text: "LOS displacement (mm)", font: { size: 10, color: "#6a91ae" } },
+      zeroline: true, zerolinecolor: "rgba(255,255,255,0.15)", zerolinewidth: 1,
+      gridcolor: "rgba(255,255,255,0.05)", tickfont: { size: 10, color: "#6a91ae" },
+      range: [markerY - yRange * 0.05, yMax + yRange * 0.1],
+    },
+    yaxis2: {
+      domain: [0, 0.28],
+      title: { text: "Coherence", font: { size: 10, color: "#6a91ae" } },
+      range: [0, 1], gridcolor: "rgba(255,255,255,0.05)", tickfont: { size: 10, color: "#6a91ae" },
+    },
+    margin: { l: 50, r: 10, t: 8, b: 28 },
+    paper_bgcolor: "rgba(0,0,0,0)", plot_bgcolor: "rgba(15,32,51,0.45)",
+    showlegend: true,
+    legend: { x: 0, y: 1.03, xanchor: "left", yanchor: "bottom", orientation: "h", font: { size: 9, color: "#6a91ae" }, bgcolor: "rgba(0,0,0,0)" },
+    font: { family: "Inter,Segoe UI,system-ui,sans-serif" },
+  };
+
+  return { traces, layout };
+}
+
+function showTimePanel(info) {
+  document.getElementById("pixel-summary").innerHTML = buildSummaryHtml(info);
+
+  const chartDiv = document.getElementById("ts-chart");
+  chartDiv.innerHTML = "";
+  const wrapH = document.getElementById("ts-chart-wrap").clientHeight - 8;
+  const { traces, layout } = buildPlotlyData(info);
+  layout.height = Math.max(300, wrapH);
+
+  Plotly.newPlot(chartDiv, traces, layout, { responsive: true, displayModeBar: false, scrollZoom: false });
+  document.getElementById("time-panel").classList.add("open");
+}
+
+document.getElementById("close-time-panel").addEventListener("click", () => {
+  document.getElementById("time-panel").classList.remove("open");
+});
+
+// ── About modal ────────────────────────────────────────────────────────────────
+async function loadAbout() {
+  const body = document.getElementById("about-body");
+  body.innerHTML = `<div style="text-align:center;padding:36px"><span class="spin"></span></div>`;
+  openAbout();
+  try {
+    const data = await fetch("/api/metadata").then(r => r.json());
+    body.innerHTML = buildAboutHtml(data);
+  } catch { body.innerHTML = `<p style="color:var(--danger);padding:16px">Failed to load metadata.</p>`; }
+}
+
+function buildAboutHtml(data) {
+  const m = data.metadata || {}, p = data.parameters || {};
+  const scenes = m.scenes || p.scenes || {}, tw = m.time_window || p.time_window || {};
+  const coh = m.coherence_masking || p.coherence_masking || {};
+  const proc = m.processing || p.processing || {}, units = m.units || {}, notes = m.notes || {};
+  const pairs = m.pairs || p.pairs || {};
+
+  const dl = rows => `<div class="a-dl">${rows.map(([k,v]) =>
+    `<span class="a-dt">${esc(k)}</span><span class="a-dd">${esc(String(v ?? "—"))}</span>`
+  ).join("")}</div>`;
+
+  const chips = (scenes.dates || []).map(d => `<span class="scene-chip">${esc(d)}</span>`).join("");
+  const note = (text, warn=false) => text ? `<div class="a-note ${warn?"warn-note":""}">${esc(text)}</div>` : "";
+
+  return `
+    <div class="a-section"><h3>Dataset</h3>${dl([
+      ["File", data.dataset],
+      ["Project", `${m.project||p.project||"—"} / ${m.orbit||p.orbit||"—"}`],
+      ["Processing date", (m.processing_date_utc||p.processing_date||"").slice(0,10)],
+      ["PyGMTSAR", m.pygmtsar_version||"—"],
+    ])}</div>
+    <div class="a-section"><h3>Time Window</h3>${dl([
+      ["Start", tw.start||"—"], ["End", tw.end||"—"],
+      ["Duration", tw.days?`${tw.days} days`:"—"],
+      ["Scenes", scenes.count?`${scenes.count} acquisitions`:"—"],
+      ["Pairs used", pairs.best_used!=null?`${pairs.best_used} of ${pairs.initial}`:"—"],
+    ])}${chips?`<div class="scene-chips">${chips}</div>`:""}</div>
+    <div class="a-section"><h3>Processing</h3>${dl([
+      ["Coherence threshold", coh.coh_threshold!=null?`${coh.coh_threshold} (${coh.coh_mask_method||"median"})`:"—"],
+      ["Dynamic coh. mask", coh.dynamic_coh_mask_actually_used?"Enabled":"Disabled"],
+      ["Segmented output", coh.segmented_actually_created?"Created":"Not created"],
+      ["Geocode resolution", proc.geocode_res_m?`${proc.geocode_res_m} m`:"—"],
+      ["SBAS wavelength", proc.sbas_wavelength_m?`${proc.sbas_wavelength_m} m`:"—"],
+    ])}</div>
+    <div class="a-section"><h3>Units</h3>${dl(Object.entries(units).map(([k,v])=>[k,v]))}</div>
+    <div class="a-section"><h3>Technical Notes</h3>
+      ${note(notes.segmented_warning, true)}
+      ${note(notes.displacement_reference)}
+      ${note(notes.dynamic_coherence_approximation)}
+      ${note(notes.mask_interpretation)}
+    </div>`;
+}
+
+function openAbout() {
+  document.getElementById("about-backdrop").classList.add("open");
+  document.getElementById("about-modal").classList.add("open");
+}
+function closeAbout() {
+  document.getElementById("about-backdrop").classList.remove("open");
+  document.getElementById("about-modal").classList.remove("open");
+}
+
+document.getElementById("about-btn").addEventListener("click", loadAbout);
+document.getElementById("close-about").addEventListener("click", closeAbout);
+document.getElementById("about-backdrop").addEventListener("click", closeAbout);
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape") { closeAbout(); document.getElementById("time-panel").classList.remove("open"); }
+});
+
+// ── Sidebar toggle ─────────────────────────────────────────────────────────────
+document.getElementById("sidebar-toggle").addEventListener("click", () => {
+  const sidebar = document.getElementById("poi-sidebar");
+  const mapEl = document.getElementById("map");
+  const legends = document.getElementById("legend-stack");
+  const collapsed = sidebar.classList.toggle("collapsed");
+  mapEl.style.left = collapsed ? "0" : "var(--left-w)";
+  legends.style.left = collapsed ? "10px" : "calc(var(--left-w) + 10px)";
+  setTimeout(() => S.map && S.map.invalidateSize(), 200);
+});
+
+// ── Boot ───────────────────────────────────────────────────────────────────────
+async function boot() {
+  try {
+    const payload = await fetch("/api/viewer").then(r => r.json());
+    S.payload = payload;
+
+    initLayerState(payload);
+    initMap(payload);
+    renderLayerLists(payload);
+    payload.baseLayers.forEach(l => syncBase(l));
+    payload.dataLayers.forEach(l => syncData(l));
+    renderLegends();
+    initCohFilter(payload);
+    initDateSlider(payload);
+    renderPoiList(payload.pois);
+    loadCohGrid();  // background: coherence values for pixel counter
+  } catch (err) {
+    console.error("Boot failed:", err);
+    document.body.innerHTML = `<div style="padding:40px;color:#ef5350;font-family:monospace">
+      <h2>Viewer failed to start</h2><pre>${esc(String(err))}</pre>
+      <p>Check the terminal for more details.</p>
+    </div>`;
+  }
+}
+
+boot();
+</script>
 </body>
 </html>
 """
 
+
+# ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     args = parse_args()
@@ -1516,12 +1832,16 @@ if __name__ == "__main__":
         if args.dataset is not None
         else default_dataset_path(project_paths)
     )
-    VIEWER_DATA = load_viewer_data(dataset_path, project_paths.parameters_path)
 
-    print(f"Project folder: {project_paths.root_dir}")
-    print(f"Product folder: {project_paths.product_dir}")
-    print(f"Dataset: {dataset_path}")
-    print(f"Open: http://{args.host}:{args.port}")
+    VIEWER_DATA = load_viewer_data(dataset_path, project_paths)
+
+    print(f"Project : {project_paths.root_dir}")
+    print(f"Product : {project_paths.product_dir}")
+    print(f"Dataset : {dataset_path}")
+    print(f"Dates   : {len(VIEWER_DATA.dates)} scenes  ({', '.join(d.strftime('%Y-%m-%d') for d in VIEWER_DATA.dates)})")
+    print(f"Grid    : {len(VIEWER_DATA.latitudes)}×{len(VIEWER_DATA.longitudes)}  ({int(VIEWER_DATA.spatial_mask.sum())} valid pixels)")
+    print(f"POIs    : {len(VIEWER_DATA.pois)}")
+    print(f"Open    : http://{args.host}:{args.port}")
 
     flask_app = create_app()
     flask_app.run(host=args.host, port=args.port, debug=args.debug, use_reloader=args.debug)
