@@ -10,6 +10,9 @@ export default defineConfig({
       '/overlay': 'http://127.0.0.1:8050',
     },
   },
+  optimizeDeps: {
+    include: ['react-plotly.js', 'plotly.js'],
+  },
   build: {
     outDir: 'dist',
     sourcemap: false,

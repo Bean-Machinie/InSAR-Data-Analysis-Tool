@@ -18,6 +18,8 @@
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 html, body, #root { height: 100%; overflow: hidden; background: var(--bg); color: var(--text); font-family: "Inter","Segoe UI",system-ui,sans-serif; font-size: 13px; }
 
+@keyframes spin { to { transform: rotate(360deg); } }
+
 /* Leaflet overrides */
 .leaflet-image-layer { image-rendering: pixelated; image-rendering: crisp-edges; pointer-events: none; }
 .leaflet-control-attribution { font-size: 9px; background: rgba(11,24,37,0.75) !important; color: #8ca8be !important; }
