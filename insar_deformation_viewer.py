@@ -45,7 +45,7 @@ from insar_project import (
 # ── Runtime constants ──────────────────────────────────────────────────────────
 
 DEFAULT_ZOOM = 13
-DEFAULT_COH_THRESHOLD = 0.45   # conservative customer default (processing typically uses 0.30)
+DEFAULT_COH_THRESHOLD = 0.30   # matches processing default (parameters.json coh_threshold)
 COH_SLIDER_STEP = 0.05
 SEGMENT_COLORS = ["#2166ac", "#e08214", "#4dac26", "#9e0142", "#abd9e9"]
 
@@ -284,25 +284,17 @@ def coordinate_edges(values: np.ndarray) -> np.ndarray:
     return np.concatenate([[first], midpoints, [last]])
 
 
-def build_spatial_mask(
-    dataset: xr.Dataset,
-    latitudes: np.ndarray,
-    longitudes: np.ndarray,
-    aoi_coords: list[tuple[float, float]],
-) -> np.ndarray:
-    if "aoi_mask" in dataset:
-        return dataset["aoi_mask"].transpose("lat", "lon").values.astype(bool)
+def build_spatial_mask(dataset: xr.Dataset) -> np.ndarray:
+    # Use sbas_velocity_raw as the extent mask: covers all processed pixels
+    # regardless of AOI or coherence threshold (the broadest meaningful extent).
+    for var_name in ("sbas_velocity_raw", "sbas_velocity_masked"):
+        if var_name in dataset.data_vars:
+            arr = dataset[var_name].transpose("lat", "lon").values
+            mask = np.isfinite(arr)
+            if np.any(mask):
+                return mask
 
-    if aoi_coords:
-        try:
-            from matplotlib.path import Path as MplPath
-            lon_grid, lat_grid = np.meshgrid(longitudes, latitudes)
-            points = np.column_stack([lon_grid.ravel(), lat_grid.ravel()])
-            mask = MplPath(aoi_coords).contains_points(points, radius=1e-12)
-            return mask.reshape((len(latitudes), len(longitudes)))
-        except ImportError:
-            pass
-
+    # Fallback: any pixel finite in any data variable
     candidates = []
     for spec in REQUESTED_DATA_LAYERS:
         if spec.variable is None or spec.variable not in dataset.data_vars:
@@ -395,7 +387,7 @@ def load_viewer_data(dataset_path: Path, project_paths: ProjectPaths) -> ViewerD
 
     latitudes = dataset["lat"].values.astype("float64")
     longitudes = dataset["lon"].values.astype("float64")
-    spatial_mask = build_spatial_mask(dataset, latitudes, longitudes, aoi_coords)
+    spatial_mask = build_spatial_mask(dataset)
 
     if not np.any(spatial_mask):
         raise ValueError("No pixels inside the spatial mask.")
@@ -670,15 +662,16 @@ def coherence_grid_payload() -> dict:
 
 def cell_index_from_latlon(lat: float, lon: float) -> tuple[int, int] | None:
     data = require_viewer_data()
-    if not (data.lat_edges[0] <= lat <= data.lat_edges[-1]):
+    lat_arr, lon_arr = data.latitudes, data.longitudes
+    dy = abs(lat_arr[1] - lat_arr[0]) if len(lat_arr) > 1 else 1e-4
+    dx = abs(lon_arr[1] - lon_arr[0]) if len(lon_arr) > 1 else 1e-4
+    if lat < lat_arr[0] - dy or lat > lat_arr[-1] + dy:
         return None
-    if not (data.lon_edges[0] <= lon <= data.lon_edges[-1]):
+    if lon < lon_arr[0] - dx or lon > lon_arr[-1] + dx:
         return None
-    row = int(np.searchsorted(data.lat_edges, lat, side="right") - 1)
-    col = int(np.searchsorted(data.lon_edges, lon, side="right") - 1)
-    if not (0 <= row < len(data.latitudes) and 0 <= col < len(data.longitudes)):
-        return None
-    return row, col
+    i = int(np.argmin(np.abs(lat_arr - lat)))
+    j = int(np.argmin(np.abs(lon_arr - lon)))
+    return i, j
 
 
 def pixel_payload(lat: float, lon: float) -> dict:
@@ -688,7 +681,7 @@ def pixel_payload(lat: float, lon: float) -> dict:
         return {"found": False, "reason": "outside grid"}
     row, col = index
     if not data.spatial_mask[row, col]:
-        return {"found": False, "reason": "outside AOI"}
+        return {"found": False, "reason": "no data at this location"}
 
     ps = data.pixel_series
     raw_arr = ps.get("raw")
@@ -760,6 +753,46 @@ def metadata_payload() -> dict:
     }
 
 
+def points_payload() -> dict:
+    """All valid pixel coordinates + velocity/coherence/displacement values for canvas rendering."""
+    data = require_viewer_data()
+    rows, cols = np.where(data.spatial_mask)
+    n = int(len(rows))
+    if n == 0:
+        return {"count": 0, "lats": [], "lons": [],
+                "vel_raw": None, "vel_masked": None, "coherence": None, "disp": None,
+                "cellLat": 0.001, "cellLon": 0.001}
+
+    def _f(v: float) -> float | None:
+        return round(float(v), 3) if math.isfinite(float(v)) else None
+
+    def static(key: str) -> list | None:
+        arr = data.static_values.get(key)
+        return [_f(arr[r, c]) for r, c in zip(rows, cols)] if arr is not None else None
+
+    def temporal(key: str) -> list[list] | None:
+        arr = data.temporal_values.get(key)
+        if arr is None:
+            return None
+        return [[_f(arr[t, r, c]) for r, c in zip(rows, cols)] for t in range(arr.shape[0])]
+
+    lat_arr, lon_arr = data.latitudes, data.longitudes
+    cell_lat = float(abs(lat_arr[1] - lat_arr[0])) if len(lat_arr) > 1 else 0.001
+    cell_lon = float(abs(lon_arr[1] - lon_arr[0])) if len(lon_arr) > 1 else 0.001
+
+    return {
+        "count": n,
+        "lats": [round(float(lat_arr[r]), 6) for r in rows],
+        "lons": [round(float(lon_arr[c]), 6) for c in cols],
+        "vel_raw":   static("sbas_velocity_raw"),
+        "vel_masked": static("sbas_velocity_masked"),
+        "coherence":  static("coherence_median"),
+        "disp":       temporal("sbas_displacement_masked"),
+        "cellLat": round(cell_lat, 7),
+        "cellLon": round(cell_lon, 7),
+    }
+
+
 # ── Flask app ──────────────────────────────────────────────────────────────────
 
 def create_app() -> Flask:
@@ -793,12 +826,9 @@ def create_app() -> Flask:
         return Response(content, mimetype="image/png",
                         headers={"Cache-Control": "public, max-age=3600"})
 
-    @app.get("/overlay/velocity_coh_filtered/<int:threshold_pct>.png")
-    def coh_filtered_overlay_api(threshold_pct: int) -> Response:
-        pct = max(10, min(90, threshold_pct))
-        content = coh_filtered_velocity_png_bytes(pct)
-        return Response(content, mimetype="image/png",
-                        headers={"Cache-Control": "public, max-age=3600"})
+    @app.get("/api/points")
+    def points_api():
+        return jsonify(points_payload())
 
     return app
 
@@ -1155,8 +1185,8 @@ APP_HTML = r"""<!DOCTYPE html>
         </label>
       </div>
       <div class="coh-slider-labels"><span>0.10</span><span>0.90</span></div>
-      <input type="range" id="coh-slider" min="10" max="90" step="5" value="45" />
-      <div id="coh-threshold-display">0.45</div>
+      <input type="range" id="coh-slider" min="10" max="90" step="5" value="30" />
+      <div id="coh-threshold-display">0.30</div>
       <div id="coh-pixel-count"><span class="spin"></span></div>
     </div>
   </aside>
@@ -1196,16 +1226,186 @@ APP_HTML = r"""<!DOCTYPE html>
 const SEG_COLORS = ["#2166ac","#e08214","#4dac26","#9e0142","#abd9e9"];
 const PRIMARY_VEL_KEY = "sbas_velocity_masked";
 const DISP_KEY = "sbas_displacement_masked";
+// These layers are rendered by DataCanvas (vectorized circles), not PNG imageOverlays
+const CANVAS_KEYS = new Set(["sbas_velocity_masked", "sbas_velocity_raw", "sbas_displacement_masked"]);
+
+// ── Colormap (RdBu_r — matches matplotlib) ─────────────────────────────────────
+const RDBU_R = [
+  [0.000, [5,   48,  97 ]],
+  [0.125, [33,  102, 172]],
+  [0.250, [67,  147, 195]],
+  [0.375, [146, 197, 222]],
+  [0.500, [247, 247, 247]],
+  [0.625, [244, 165, 130]],
+  [0.750, [214, 96,  77 ]],
+  [0.875, [178, 24,  43 ]],
+  [1.000, [103, 0,   31 ]],
+];
+function _lerpStops(stops, t) {
+  t = Math.max(0, Math.min(1, t));
+  for (let i = 0; i < stops.length - 1; i++) {
+    const [t0, c0] = stops[i], [t1, c1] = stops[i + 1];
+    if (t <= t1) {
+      const f = (t - t0) / (t1 - t0);
+      return `rgb(${Math.round(c0[0]+f*(c1[0]-c0[0]))},${Math.round(c0[1]+f*(c1[1]-c0[1]))},${Math.round(c0[2]+f*(c1[2]-c0[2]))})`;
+    }
+  }
+  return `rgb(103,0,31)`;
+}
+function valueToColor(v, vmin, vmax) {
+  if (v === null || !isFinite(v)) return null;
+  // TwoSlopeNorm equivalent: [vmin,0,vmax] → [0,0.5,1]
+  const t = v <= 0 ? 0.5 * (v - vmin) / (0 - vmin) : 0.5 + 0.5 * v / vmax;
+  return _lerpStops(RDBU_R, t);
+}
+
+// ── DataCanvas — vectorized circle layer ───────────────────────────────────────
+class DataCanvas {
+  constructor(map) {
+    this._map = map;
+    this._el = document.createElement("canvas");
+    this._el.style.cssText = "position:absolute;top:0;left:0;pointer-events:none;";
+    map.getPanes().dataPane.appendChild(this._el);
+    this._ctx = this._el.getContext("2d");
+    this._pts = null;    // points data from server
+    this._mode = null;   // "vel_masked"|"vel_raw"|"vel_coh"|"disp"
+    this._thr  = 0.30;
+    this._didx = 0;
+    this._opa  = 0.87;
+    this._vmin = -10; this._vmax = 10;
+    this._cellLat = 0.001; this._cellLon = 0.001;
+    this._rafPending = false;
+
+    // `move` fires continuously during pan so circles stay locked to geography.
+    // We throttle through rAF so we don't draw faster than the display refreshes.
+    const sched = () => {
+      if (this._rafPending) return;
+      this._rafPending = true;
+      requestAnimationFrame(() => { this._rafPending = false; this._draw(); });
+    };
+    map.on("move zoom zoomend resize", sched);
+  }
+
+  setData(pts) {
+    this._pts = pts;
+    this._cellLat = pts.cellLat;
+    this._cellLon = pts.cellLon;
+    if (this._mode) this._recompute();
+  }
+
+  render(mode, thr, didx, opa) {
+    this._mode = mode; this._thr = thr; this._didx = didx; this._opa = opa;
+    this._recompute();
+  }
+
+  clear() { this._mode = null; this._clear(); }
+
+  // Returns [vmin, vmax] based on 2–98th percentile of currently visible points
+  getRange() { return [this._vmin, this._vmax]; }
+
+  // Returns {count, total, pct} of visible vs all valid points
+  getCount() {
+    const vals = this._vals(), coh = this._pts?.coherence, thr = this._thr;
+    if (!vals) return {count: 0, total: 0, pct: 0};
+    let count = 0, total = 0;
+    for (let i = 0; i < vals.length; i++) {
+      const v = vals[i];
+      if (v === null || !isFinite(v)) continue;
+      total++;
+      if (this._mode === "vel_coh" && coh && (coh[i] === null || coh[i] < thr)) continue;
+      count++;
+    }
+    return {count, total, pct: total ? Math.round(count / total * 100) : 0};
+  }
+
+  _vals() {
+    const d = this._pts;
+    if (!d) return null;
+    if (this._mode === "vel_masked") return d.vel_masked;
+    if (this._mode === "vel_raw")    return d.vel_raw;
+    if (this._mode === "vel_coh")    return d.vel_raw;
+    if (this._mode === "disp")       return d.disp ? d.disp[this._didx] : null;
+    return null;
+  }
+
+  _recompute() {
+    const vals = this._vals(), coh = this._pts?.coherence, thr = this._thr;
+    if (!vals) { this._clear(); return; }
+    const visible = [];
+    for (let i = 0; i < vals.length; i++) {
+      const v = vals[i];
+      if (v === null || !isFinite(v)) continue;
+      if (this._mode === "vel_coh" && coh && (coh[i] === null || coh[i] < thr)) continue;
+      visible.push(v);
+    }
+    if (visible.length) {
+      visible.sort((a, b) => a - b);
+      const p2  = visible[Math.max(0, Math.floor(visible.length * 0.02))];
+      const p98 = visible[Math.min(visible.length - 1, Math.floor(visible.length * 0.98))];
+      const vr  = Math.max(Math.abs(p2), Math.abs(p98)) || 10;
+      this._vmin = -vr; this._vmax = vr;
+    }
+    this._draw();
+  }
+
+  _clear() {
+    const sz = this._map.getSize();
+    this._el.width = sz.x; this._el.height = sz.y;
+    this._ctx.clearRect(0, 0, sz.x, sz.y);
+  }
+
+  _draw() {
+    const sz = this._map.getSize();
+    this._el.width = sz.x; this._el.height = sz.y;
+    const ctx = this._ctx;
+    ctx.clearRect(0, 0, sz.x, sz.y);
+    if (!this._mode || !this._pts) return;
+
+    const d = this._pts, vals = this._vals();
+    if (!vals) return;
+    const coh = d.coherence, thr = this._thr, doCoh = this._mode === "vel_coh";
+
+    // Pane offset: dataPane is CSS-translated during pan; subtract so canvas-local
+    // coords stay locked to geography regardless of how far the user has panned.
+    const offset = this._map._getMapPanePos();
+
+    // Radius: convert one cell worth of degrees to screen pixels, take 48%
+    const ctr = this._map.getCenter();
+    const p0 = this._map.latLngToContainerPoint(L.latLng(ctr.lat, ctr.lng));
+    const p1 = this._map.latLngToContainerPoint(L.latLng(ctr.lat + this._cellLat, ctr.lng + this._cellLon));
+    const cellPxH = Math.abs(p1.y - p0.y);
+    const cellPxW = Math.abs(p1.x - p0.x);
+    const r = Math.max(1.5, Math.min(cellPxH, cellPxW) * 0.48);
+
+    ctx.globalAlpha = this._opa;
+    const vmin = this._vmin, vmax = this._vmax;
+
+    for (let i = 0; i < d.lats.length; i++) {
+      const v = vals[i];
+      if (v === null || !isFinite(v)) continue;
+      if (doCoh && (!coh || coh[i] === null || coh[i] < thr)) continue;
+      const color = valueToColor(v, vmin, vmax);
+      if (!color) continue;
+      const pt = this._map.latLngToContainerPoint(L.latLng(d.lats[i], d.lons[i]));
+      ctx.beginPath();
+      ctx.arc(pt.x - offset.x, pt.y - offset.y, r, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+}
 
 // ── State ──────────────────────────────────────────────────────────────────────
 const S = {
-  map: null, payload: null, cohGrid: null,
-  baseLayers: {}, dataLayers: {}, cohFilterLayer: null,
+  map: null, payload: null,
+  dataCanvas: null, pointsData: null,
+  baseLayers: {}, dataLayers: {},
   aoiLayer: null, selectionLayer: null,
   layerEnabled: {}, layerOpacity: {}, layerDateIndex: {},
   mode: "velocity",
   dateIndex: 0,
-  cohThreshold: 0.45,
+  cohThreshold: 0.30,
   cohFilterEnabled: false,
   activePoi: null,
   toastTimer: null,
@@ -1242,6 +1442,7 @@ function initMap(payload) {
     const el = document.getElementById(id); if (el) stopProp(el);
   });
   document.getElementById("map").addEventListener("click", onMapClick);
+  S.dataCanvas = new DataCanvas(S.map);
 }
 
 function onMapClick(e) {
@@ -1277,6 +1478,7 @@ function syncBase(layer) {
 
 function syncData(layer) {
   if (layer.kind === "aoi") { syncAoi(layer); return; }
+  if (CANVAS_KEYS.has(layer.key)) { updateCanvasMode(); return; }
   const idx = layer.temporal ? S.layerDateIndex[layer.key] : 0;
   const url = `/overlay/${encodeURIComponent(layer.key)}/${idx}.png`;
   if (!S.dataLayers[layer.key]) {
@@ -1302,6 +1504,26 @@ function syncAoi(layer) {
   const on = S.layerEnabled[layer.key];
   if (on && !S.map.hasLayer(S.aoiLayer)) S.aoiLayer.addTo(S.map);
   else if (!on && S.map.hasLayer(S.aoiLayer)) S.map.removeLayer(S.aoiLayer);
+}
+
+// ── Canvas mode arbiter ────────────────────────────────────────────────────────
+function updateCanvasMode() {
+  if (!S.dataCanvas || !S.pointsData) return;
+  const dc = S.dataCanvas;
+
+  if (S.mode === "date") {
+    dc.render("disp", S.cohThreshold, S.dateIndex, S.layerOpacity[DISP_KEY] ?? 0.86);
+  } else if (S.cohFilterEnabled) {
+    dc.render("vel_coh", S.cohThreshold, 0, 0.87);
+  } else if (S.layerEnabled[PRIMARY_VEL_KEY]) {
+    dc.render("vel_masked", S.cohThreshold, 0, S.layerOpacity[PRIMARY_VEL_KEY] ?? 0.87);
+  } else if (S.layerEnabled["sbas_velocity_raw"]) {
+    dc.render("vel_raw", S.cohThreshold, 0, S.layerOpacity["sbas_velocity_raw"] ?? 0.82);
+  } else {
+    dc.clear();
+  }
+  updateCohCount();
+  renderLegends();
 }
 
 // ── Layer UI ───────────────────────────────────────────────────────────────────
@@ -1393,8 +1615,8 @@ function renderLegends() {
       </div>`;
     stack.appendChild(card);
   }
-  if (S.cohFilterEnabled) {
-    const rng = S.payload.velocityRange;
+  if (S.cohFilterEnabled && S.dataCanvas) {
+    const rng = S.dataCanvas.getRange();
     const card = document.createElement("div"); card.className = "legend-card";
     card.innerHTML = `
       <div class="legend-title">Velocity coh ≥ ${S.cohThreshold.toFixed(2)} (mm/yr)</div>
@@ -1407,55 +1629,28 @@ function renderLegends() {
   }
 }
 
-// ── Coherence filter ───────────────────────────────────────────────────────────
-async function loadCohGrid() {
+// ── Points data loader ─────────────────────────────────────────────────────────
+async function loadPoints() {
   try {
-    S.cohGrid = await fetch("/api/coherence_grid").then(r => r.json());
-    updateCohCount();
-  } catch { S.cohGrid = null; document.getElementById("coh-pixel-count").textContent = "—"; }
-}
-
-function computePixelCount(thr) {
-  if (!S.cohGrid?.available) return null;
-  const { values, valid_mask, total_valid } = S.cohGrid;
-  let count = 0;
-  for (let i = 0; i < values.length; i++) {
-    if (valid_mask[i] && values[i] !== null && values[i] >= thr) count++;
+    const pts = await fetch("/api/points").then(r => r.json());
+    S.pointsData = pts;
+    S.dataCanvas.setData(pts);
+    updateCanvasMode();
+  } catch (err) {
+    console.error("Failed to load points data:", err);
+    document.getElementById("coh-pixel-count").textContent = "load error";
   }
-  return { count, total: total_valid, pct: Math.round(count / total_valid * 100) };
 }
 
+// ── Coherence filter ───────────────────────────────────────────────────────────
 function updateCohCount() {
   const el = document.getElementById("coh-pixel-count");
-  const r = computePixelCount(S.cohThreshold);
-  el.textContent = r ? `${r.count.toLocaleString()} px visible (${r.pct}% of AOI)` : "—";
+  if (!S.dataCanvas || !S.pointsData) { el.innerHTML = '<span class="spin"></span>'; return; }
+  const { count, total, pct } = S.dataCanvas.getCount();
+  el.textContent = `${count.toLocaleString()} px visible (${pct}% of total)`;
 }
 
-const debouncedCohOverlay = debounce(updateCohFilterOverlay, 300);
-
-function updateCohFilterOverlay() {
-  if (!S.cohFilterEnabled) {
-    if (S.cohFilterLayer && S.map.hasLayer(S.cohFilterLayer)) S.map.removeLayer(S.cohFilterLayer);
-    // Restore velocity if it was the active layer
-    const vel = S.payload.dataLayers.find(l => l.key === PRIMARY_VEL_KEY);
-    if (vel && S.layerEnabled[PRIMARY_VEL_KEY]) syncData(vel);
-    renderLegends(); return;
-  }
-  // Hide standard velocity layers
-  for (const key of [PRIMARY_VEL_KEY, "sbas_velocity_raw"]) {
-    if (S.dataLayers[key] && S.map.hasLayer(S.dataLayers[key])) S.map.removeLayer(S.dataLayers[key]);
-  }
-  const pct = Math.round(S.cohThreshold * 100);
-  const url = `/overlay/velocity_coh_filtered/${pct}.png`;
-  if (!S.cohFilterLayer) {
-    S.cohFilterLayer = L.imageOverlay(url, S.payload.bounds, { opacity: 0.87, pane: "dataPane", interactive: false });
-    S.cohFilterLayer.addTo(S.map);
-  } else {
-    if (!S.map.hasLayer(S.cohFilterLayer)) S.cohFilterLayer.addTo(S.map);
-    S.cohFilterLayer.setUrl(url);
-  }
-  renderLegends();
-}
+const debouncedCanvasUpdate = debounce(updateCanvasMode, 80);
 
 function initCohFilter(payload) {
   S.cohThreshold = payload.cohThresholdDefault;
@@ -1467,12 +1662,11 @@ function initCohFilter(payload) {
   slider.addEventListener("input", () => {
     S.cohThreshold = parseInt(slider.value) / 100;
     display.textContent = S.cohThreshold.toFixed(2);
-    updateCohCount();
-    if (S.cohFilterEnabled) debouncedCohOverlay();
+    debouncedCanvasUpdate();
   });
   document.getElementById("coh-filter-toggle").addEventListener("change", e => {
     S.cohFilterEnabled = e.target.checked;
-    updateCohFilterOverlay();
+    updateCanvasMode();
   });
 }
 
@@ -1499,33 +1693,13 @@ function initDateSlider(payload) {
 function enterDateMode(idx) {
   S.mode = "date"; S.dateIndex = idx;
   document.getElementById("velocity-btn").classList.remove("active");
-  // Hide velocity; show displacement at idx
-  for (const key of [PRIMARY_VEL_KEY, "sbas_velocity_raw"]) {
-    if (S.dataLayers[key] && S.map.hasLayer(S.dataLayers[key])) S.map.removeLayer(S.dataLayers[key]);
-  }
-  if (S.cohFilterLayer && S.map.hasLayer(S.cohFilterLayer)) S.map.removeLayer(S.cohFilterLayer);
-  S.layerEnabled[DISP_KEY] = true;
-  S.layerDateIndex[DISP_KEY] = idx;
-  const dl = S.payload.dataLayers.find(l => l.key === DISP_KEY);
-  if (dl) syncData(dl);
-  // Sync checkbox
-  const chk = document.querySelector(`[data-key="${DISP_KEY}"] input[type=checkbox]`);
-  if (chk) chk.checked = true;
-  renderLegends();
+  updateCanvasMode();
 }
 
 function enterVelocityMode() {
   S.mode = "velocity";
   document.getElementById("velocity-btn").classList.add("active");
-  // Restore velocity layer
-  const vel = S.payload.dataLayers.find(l => l.key === PRIMARY_VEL_KEY);
-  if (vel && S.layerEnabled[PRIMARY_VEL_KEY]) syncData(vel);
-  // Hide displacement if user didn't explicitly enable it
-  if (!S.layerEnabled[DISP_KEY]) {
-    if (S.dataLayers[DISP_KEY] && S.map.hasLayer(S.dataLayers[DISP_KEY])) S.map.removeLayer(S.dataLayers[DISP_KEY]);
-  }
-  if (S.cohFilterEnabled) updateCohFilterOverlay();
-  renderLegends();
+  updateCanvasMode();
 }
 
 // ── POI sidebar ────────────────────────────────────────────────────────────────
@@ -1560,12 +1734,17 @@ async function fetchPixel(latlng) {
   try {
     const r = await fetch(`/api/pixel?lat=${latlng.lat}&lon=${latlng.lng}`);
     const info = await r.json();
-    if (!info.found) { showToast(`No data here (${info.reason || "outside AOI"})`); return; }
-    // Draw selection rectangle
+    if (!info.found) { showToast(`No data here (${info.reason || "no data"})`); return; }
+    // Ring highlight centred on the exact pixel the data came from
     if (S.selectionLayer) S.map.removeLayer(S.selectionLayer);
-    S.selectionLayer = L.rectangle(info.cellBounds, {
-      pane: "selPane", color: "#29b6f6", weight: 1.5, opacity: 1,
-      fillColor: "#29b6f6", fillOpacity: 0.07, interactive: false,
+    const [[lat0, lon0], [lat1, lon1]] = info.cellBounds;
+    const cellLatM = Math.abs(lat1 - lat0) * 111320;
+    const cellLonM = Math.abs(lon1 - lon0) * 111320 * Math.cos(info.lat * Math.PI / 180);
+    const ringRadiusM = Math.min(cellLatM, cellLonM) * 0.65;
+    S.selectionLayer = L.circle([info.lat, info.lon], {
+      pane: "selPane", radius: ringRadiusM,
+      color: "#ffd740", weight: 2.5, opacity: 1,
+      fill: false, interactive: false,
     }).addTo(S.map);
     showTimePanel(info);
   } catch (err) { showToast("Pixel lookup failed"); console.error(err); }
@@ -1805,7 +1984,7 @@ async function boot() {
     initCohFilter(payload);
     initDateSlider(payload);
     renderPoiList(payload.pois);
-    loadCohGrid();  // background: coherence values for pixel counter
+    loadPoints();   // background: pixel data for canvas rendering
   } catch (err) {
     console.error("Boot failed:", err);
     document.body.innerHTML = `<div style="padding:40px;color:#ef5350;font-family:monospace">
