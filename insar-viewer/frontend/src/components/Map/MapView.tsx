@@ -35,6 +35,7 @@ function ClickHandler({ onMapClick }: { onMapClick: (lat: number, lng: number) =
   return null
 }
 
+
 // ── DataCanvas layer ──────────────────────────────────────────────────────────
 // Separate component so it has access to useMap()
 function DataCanvasLayer() {
@@ -98,7 +99,7 @@ function SelectedPixelRing() {
 
   useEffect(() => {
     if (ringRef.current) { map.removeLayer(ringRef.current); ringRef.current = null }
-    if (!selectedPixel) return
+    if (!selectedPixel || !selectedPixel.cellBounds) return
 
     const [[lat0, lon0], [lat1, lon1]] = selectedPixel.cellBounds
     const cellLatM = Math.abs(lat1 - lat0) * 111320
@@ -166,7 +167,7 @@ export function MapView({ project, onPixelClick }: Props) {
       preferCanvas
     >
       <ClickHandler onMapClick={handleClick} />
-      <DataCanvasLayer />
+<DataCanvasLayer />
       <SelectedPixelRing />
       <ScaleControl imperial={false} />
 

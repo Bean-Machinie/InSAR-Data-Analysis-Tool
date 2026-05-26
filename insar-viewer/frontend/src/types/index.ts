@@ -58,7 +58,7 @@ export interface PixelInfo {
   reason?: string
   lat: number
   lon: number
-  cellBounds: [[number, number], [number, number]]
+  cellBounds?: [[number, number], [number, number]]
   dates: string[]
   velocity_mm_yr: number | null
   coherence_median: number | null

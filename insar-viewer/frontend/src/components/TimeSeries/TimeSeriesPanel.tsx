@@ -1,17 +1,27 @@
-import { useMemo } from 'react'
+import { useMemo, useEffect, useCallback } from 'react'
 import _Plot from 'react-plotly.js'
 import type { PixelInfo } from '../../types'
+import { useViewerStore } from '../../stores/viewerStore'
 
 // react-plotly.js is CommonJS; Vite interop may wrap it — unwrap if needed
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const Plot = (_Plot as any).default ?? _Plot
-import { useViewerStore } from '../../stores/viewerStore'
 
 const SEG_COLORS = ['#29b6f6', '#00c896', '#ffb74d', '#ef5350', '#ab47bc', '#26c6da', '#d4e157']
 
 export function TimeSeriesPanel() {
-  const { selectedPixel, setSelectedPixel } = useViewerStore()
-  if (!selectedPixel) return null
+  const { selectedPixel, pixelLoading, setSelectedPixel } = useViewerStore()
+
+  const handleEscape = useCallback((e: KeyboardEvent) => {
+    if (e.key === 'Escape') setSelectedPixel(null)
+  }, [setSelectedPixel])
+
+  useEffect(() => {
+    window.addEventListener('keydown', handleEscape)
+    return () => window.removeEventListener('keydown', handleEscape)
+  }, [handleEscape])
+
+  if (!selectedPixel && !pixelLoading) return null
 
   return (
     <div style={{
@@ -21,27 +31,73 @@ export function TimeSeriesPanel() {
       display: 'flex', flexDirection: 'column',
       zIndex: 600,
     }}>
-      <PanelHeader pixel={selectedPixel} onClose={() => setSelectedPixel(null)} />
-      {selectedPixel.found
-        ? <PanelBody pixel={selectedPixel} />
-        : <NotFound pixel={selectedPixel} />}
+      {pixelLoading || !selectedPixel
+        ? <LoadingState onClose={() => setSelectedPixel(null)} />
+        : <>
+            <PanelHeader pixel={selectedPixel} onClose={() => setSelectedPixel(null)} />
+            {selectedPixel.found
+              ? <PanelBody pixel={selectedPixel} />
+              : <NotFound pixel={selectedPixel} />}
+          </>}
+    </div>
+  )
+}
+
+function LoadingState({ onClose }: { onClose: () => void }) {
+  return (
+    <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 16px' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, color: 'var(--text2)', fontSize: 12 }}>
+        <span style={{
+          display: 'inline-block', width: 14, height: 14,
+          border: '2px solid var(--border2)', borderTopColor: 'var(--accent)',
+          borderRadius: '50%', animation: 'spin 0.7s linear infinite',
+        }} />
+        Fetching pixel data…
+      </div>
+      <button onClick={onClose} style={{ background: 'transparent', border: 'none', color: 'var(--text2)', cursor: 'pointer', fontSize: 18 }}>&#xd7;</button>
     </div>
   )
 }
 
 function PanelHeader({ pixel, onClose }: { pixel: PixelInfo; onClose: () => void }) {
+  const handleExport = () => {
+    const url = `/api/export/timeseries-csv?lat=${pixel.lat}&lon=${pixel.lon}`
+    const a = document.createElement('a')
+    a.href = url
+    a.download = 'insar_timeseries.csv'
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+  }
+
   return (
     <div style={{
       display: 'flex', alignItems: 'center', padding: '5px 12px',
-      borderBottom: '1px solid var(--border)', flexShrink: 0, gap: 10,
+      borderBottom: '1px solid var(--border)', flexShrink: 0, gap: 8,
     }}>
       <span style={{ fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.6px', color: 'var(--text2)', flex: 1 }}>
         Pixel Time Series
       </span>
       {pixel.has_gap && (
-        <span style={{ fontSize: 10, color: 'var(--warn)' }}>
-          &#9888; Gap detected in segmentation
-        </span>
+        <span style={{ fontSize: 10, color: 'var(--warn)' }}>&#9888; Gap in segmentation</span>
+      )}
+      {pixel.found && (
+        <button
+          onClick={handleExport}
+          title="Download time-series as CSV"
+          style={{
+            height: 22, padding: '0 8px',
+            background: 'transparent',
+            border: '1px solid var(--border2)',
+            borderRadius: 4, color: 'var(--text2)',
+            cursor: 'pointer', fontSize: 10,
+            transition: 'border-color 0.15s, color 0.15s',
+          }}
+          onMouseEnter={(e) => { e.currentTarget.style.borderColor = 'var(--accent2)'; e.currentTarget.style.color = 'var(--accent2)' }}
+          onMouseLeave={(e) => { e.currentTarget.style.borderColor = 'var(--border2)'; e.currentTarget.style.color = 'var(--text2)' }}
+        >
+          ↓ CSV
+        </button>
       )}
       <button
         onClick={onClose}
@@ -62,7 +118,7 @@ function NotFound({ pixel }: { pixel: PixelInfo }) {
   return (
     <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text2)', fontSize: 12 }}>
       {pixel.below_static_mask
-        ? 'Pixel is outside the static mask (low coherence region).'
+        ? 'Outside the static mask (low coherence region).'
         : (pixel.reason ?? 'No data at this location.')}
     </div>
   )
@@ -117,7 +173,6 @@ function TimeSeriesChart({ pixel }: { pixel: PixelInfo }) {
   const data = useMemo<any[]>(() => {
     const traces = []
 
-    // Coherence bar (secondary y-axis, behind other traces)
     traces.push({
       type: 'bar',
       x: dates,
@@ -126,10 +181,8 @@ function TimeSeriesChart({ pixel }: { pixel: PixelInfo }) {
       name: 'Coherence',
       marker: { color: 'rgba(106,145,174,0.22)' },
       hovertemplate: '%{x}: %{y:.3f}<extra>Coherence</extra>',
-      showlegend: true,
     })
 
-    // Raw displacement (all epochs, grey dotted)
     traces.push({
       type: 'scatter',
       mode: 'lines+markers',
@@ -141,28 +194,20 @@ function TimeSeriesChart({ pixel }: { pixel: PixelInfo }) {
       hovertemplate: '%{x}: %{y:.1f} mm<extra>Raw</extra>',
     })
 
-    // Dropped epochs (red ×)
     const dropX: string[] = []
     const dropY: (number | null)[] = []
     for (let i = 0; i < dates.length; i++) {
-      if (series.valid_time_mask[i] === 0) {
-        dropX.push(dates[i])
-        dropY.push(series.raw[i])
-      }
+      if (series.valid_time_mask[i] === 0) { dropX.push(dates[i]); dropY.push(series.raw[i]) }
     }
     if (dropX.length) {
       traces.push({
-        type: 'scatter',
-        mode: 'markers',
-        x: dropX,
-        y: dropY,
-        name: 'Dropped',
+        type: 'scatter', mode: 'markers',
+        x: dropX, y: dropY, name: 'Dropped',
         marker: { symbol: 'x', color: '#ef5350', size: 8, line: { color: '#ef5350', width: 2 } },
         hovertemplate: '%{x}<extra>Dropped</extra>',
       })
     }
 
-    // Segmented traces, one per unique segment_id
     const uniqueSegs = [...new Set(series.segment_id)]
     for (const segId of uniqueSegs) {
       const color = SEG_COLORS[segId % SEG_COLORS.length]
@@ -170,19 +215,15 @@ function TimeSeriesChart({ pixel }: { pixel: PixelInfo }) {
       const segY: (number | null)[] = []
       for (let i = 0; i < dates.length; i++) {
         if (series.segment_id[i] === segId && series.valid_time_mask[i] === 1 && series.segmented[i] != null) {
-          segX.push(dates[i])
-          segY.push(series.segmented[i])
+          segX.push(dates[i]); segY.push(series.segmented[i])
         }
       }
       if (segX.length) {
         traces.push({
-          type: 'scatter',
-          mode: 'lines+markers',
-          x: segX,
-          y: segY,
+          type: 'scatter', mode: 'lines+markers',
+          x: segX, y: segY,
           name: uniqueSegs.length > 1 ? `Seg ${segId}` : 'Segmented',
-          line: { color, width: 2 },
-          marker: { color, size: 5 },
+          line: { color, width: 2 }, marker: { color, size: 5 },
           hovertemplate: `%{x}: %{y:.1f} mm<extra>${uniqueSegs.length > 1 ? `Seg ${segId}` : 'Segmented'}</extra>`,
         })
       }
@@ -198,45 +239,27 @@ function TimeSeriesChart({ pixel }: { pixel: PixelInfo }) {
     font: { color: '#cce0f0', family: 'Inter,Segoe UI,system-ui,sans-serif', size: 11 },
     margin: { l: 52, r: 52, t: 6, b: 46 },
     xaxis: {
-      showgrid: true,
-      gridcolor: 'rgba(255,255,255,0.05)',
-      tickfont: { size: 9 },
-      tickangle: -40,
-      zeroline: false,
-      linecolor: 'rgba(255,255,255,0.1)',
+      showgrid: true, gridcolor: 'rgba(255,255,255,0.05)',
+      tickfont: { size: 9 }, tickangle: -40,
+      zeroline: false, linecolor: 'rgba(255,255,255,0.1)',
     },
     yaxis: {
       title: { text: 'Displacement (mm)', font: { size: 9 }, standoff: 4 },
-      showgrid: true,
-      gridcolor: 'rgba(255,255,255,0.07)',
-      zeroline: true,
-      zerolinecolor: 'rgba(255,255,255,0.18)',
-      zerolinewidth: 1,
+      showgrid: true, gridcolor: 'rgba(255,255,255,0.07)',
+      zeroline: true, zerolinecolor: 'rgba(255,255,255,0.18)', zerolinewidth: 1,
       tickfont: { size: 9 },
     },
     yaxis2: {
       title: { text: 'Coh', font: { size: 9 }, standoff: 2 },
-      overlaying: 'y',
-      side: 'right',
-      range: [0, 1.05],
-      showgrid: false,
-      tickfont: { size: 9 },
+      overlaying: 'y', side: 'right',
+      range: [0, 1.05], showgrid: false, tickfont: { size: 9 },
     },
     legend: {
-      bgcolor: 'rgba(0,0,0,0)',
-      font: { size: 9 },
-      x: 0,
-      y: 1,
-      xanchor: 'left',
-      yanchor: 'top',
-      orientation: 'h',
+      bgcolor: 'rgba(0,0,0,0)', font: { size: 9 },
+      x: 0, y: 1, xanchor: 'left', yanchor: 'top', orientation: 'h',
     },
     hovermode: 'x unified',
-    hoverlabel: {
-      bgcolor: '#0f2033',
-      bordercolor: 'rgba(255,255,255,0.15)',
-      font: { size: 10, color: '#cce0f0' },
-    },
+    hoverlabel: { bgcolor: '#0f2033', bordercolor: 'rgba(255,255,255,0.15)', font: { size: 10, color: '#cce0f0' } },
   }), [])
 
   return (

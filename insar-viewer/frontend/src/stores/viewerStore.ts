@@ -13,6 +13,7 @@ interface ViewerStore {
   cohFilterEnabled: boolean
   layers: Record<string, LayerState>
   selectedPixel: PixelInfo | null
+  pixelLoading: boolean
   pointsData: PointsData | null
   setDateIndex: (i: number) => void
   setMode: (m: 'velocity' | 'date') => void
@@ -21,6 +22,7 @@ interface ViewerStore {
   setLayerEnabled: (key: string, v: boolean) => void
   setLayerOpacity: (key: string, v: number) => void
   setSelectedPixel: (p: PixelInfo | null) => void
+  setPixelLoading: (v: boolean) => void
   setPointsData: (d: PointsData | null) => void
   resetLayers: (defaults: Record<string, LayerState>) => void
 }
@@ -32,6 +34,7 @@ export const useViewerStore = create<ViewerStore>((set) => ({
   cohFilterEnabled: false,
   layers: {},
   selectedPixel: null,
+  pixelLoading: false,
   pointsData: null,
   setDateIndex: (i) => set({ dateIndex: i }),
   setMode: (m) => set({ mode: m }),
@@ -42,6 +45,7 @@ export const useViewerStore = create<ViewerStore>((set) => ({
   setLayerOpacity: (key, v) =>
     set((s) => ({ layers: { ...s.layers, [key]: { ...s.layers[key], opacity: v } } })),
   setSelectedPixel: (p) => set({ selectedPixel: p }),
+  setPixelLoading: (v) => set({ pixelLoading: v }),
   setPointsData: (d) => set({ pointsData: d }),
   resetLayers: (defaults) => set({ layers: defaults }),
 }))
